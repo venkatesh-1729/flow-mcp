@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { chromium, type Browser, type Page } from "playwright-core";
@@ -15,20 +16,28 @@ export const DOWNLOAD_DIR = join(HOME_DIR, "downloads");
 export const CDP_PORT = Number(process.env.FLOW_MCP_CDP_PORT ?? 9339);
 const CDP_URL = `http://127.0.0.1:${CDP_PORT}`;
 
-// FLOW_MCP_BROWSER=attach drives the user's own running Chrome, already signed in to Flow, instead of a profile this
-// tool launches. Chrome 144+ allows it once "Allow remote debugging for this browser instance" is on
-// (chrome://inspect/#remote-debugging); Chrome then writes DevToolsActivePort into its data folder and asks the user to
-// Allow each new connection. The tool works in a window of its own there and never touches the user's other tabs.
-// Every flow-mcp process (the MCP server an app starts, the Studio panel, scripts) must agree on this, so it can also be
-// set once in ~/.flow-mcp/config.json ({"browser": "attach"}) instead of in each launcher's environment.
+// Which Chrome the tool drives, set by FLOW_MCP_BROWSER or once in ~/.flow-mcp/config.json ({"browser": ...}), which
+// every flow-mcp process (the MCP server an app starts, the Studio panel, scripts) reads alike:
+// - "own" (default): a dedicated profile this tool launches, signed in once by hand.
+// - "extension": the user's everyday Chrome, already signed in, through Microsoft's Playwright Extension and the token on
+//   its status page (~/.flow-mcp/extension-token). No prompt ever: the token approves each connection. The extension
+//   only reaches tabs the tool opens, and Chrome shows its "started debugging this browser" bar while connected.
+// - "attach": the everyday Chrome through Chrome 144+'s "Allow remote debugging for this browser instance"
+//   (chrome://inspect/#remote-debugging), which asks the user to Allow every new connection.
+// In the user's Chrome the tool works in a window of its own and never touches the user's other tabs.
 const CONFIG = (() => {
   try {
-    return JSON.parse(readFileSync(join(HOME_DIR, "config.json"), "utf8")) as { browser?: string };
+    return JSON.parse(readFileSync(join(HOME_DIR, "config.json"), "utf8")) as { browser?: string; chrome_profile?: string };
   } catch {
     return {};
   }
 })();
-export const ATTACH = (process.env.FLOW_MCP_BROWSER ?? CONFIG.browser) === "attach";
+const MODE = process.env.FLOW_MCP_BROWSER ?? CONFIG.browser ?? "own";
+export const ATTACH = MODE === "attach";
+export const EXTENSION = MODE === "extension";
+const EXTENSION_TOKEN = join(HOME_DIR, "extension-token");
+const EXTENSION_STEPS =
+  "Install Microsoft's Playwright Extension in your everyday Chrome (https://chromewebstore.google.com/detail/playwright-extension/mmlmfjhmonkocbjadbfplnigmagldckm), copy the token on its status page, and save it with: pbpaste > ~/.flow-mcp/extension-token";
 const CHROME_DATA_DIR =
   process.env.FLOW_MCP_CHROME_DATA ??
   (IS_MAC
@@ -139,7 +148,71 @@ async function attachToUsersChrome(): Promise<Browser> {
   }
 }
 
+type CoreTools = {
+  createBrowserWithInfo(config: object, client: { clientName: string }, options: object): Promise<{ browser: Browser }>;
+};
+
+// Joins the user's running Chrome through Microsoft's Playwright Extension, with Playwright's own relay for it (the one
+// Playwright MCP's --extension uses, inside playwright-core; pinned in package.json since it is not public API). The
+// token from the extension's status page approves the connection, so nothing is asked of the user. The relay opens the
+// extension's connect page in the profile that has the extension (Default unless config.json says "chrome_profile").
+async function viaExtension(): Promise<Browser> {
+  let token = process.env.PLAYWRIGHT_MCP_EXTENSION_TOKEN;
+  if (!token) {
+    try {
+      // The status page's copy button copies the whole line, "PLAYWRIGHT_MCP_EXTENSION_TOKEN=<token>": keep the value.
+      token = readFileSync(EXTENSION_TOKEN, "utf8")
+        .trim()
+        .replace(/^(export\s+)?PLAYWRIGHT_MCP_EXTENSION_TOKEN\s*=\s*/, "")
+        .replace(/^["']|["']$/g, "");
+    } catch {
+      // checked below
+    }
+  }
+  if (!token) throw new Error(`No Playwright Extension token in ${EXTENSION_TOKEN}. ${EXTENSION_STEPS}`);
+  process.env.PLAYWRIGHT_MCP_EXTENSION_TOKEN = token;
+  process.env.PLAYWRIGHT_MCP_PROFILE_DIR_NAME ??= CONFIG.chrome_profile ?? "Default";
+  const { tools } = createRequire(import.meta.url)("playwright-core/lib/coreBundle") as { tools: CoreTools };
+  try {
+    const { browser: joined } = await tools.createBrowserWithInfo({ browser: {}, extension: true }, { clientName: "flow-mcp" }, {});
+    // Between jobs nothing else crosses the connection, and Chrome stops an idle extension worker after about 30 s,
+    // which would drop it: a tiny command every 20 s keeps it open for as long as this process runs.
+    const beat = setInterval(() => {
+      const page = joined.contexts()[0]?.pages()[0];
+      void page?.evaluate("1").catch(() => {});
+    }, 20_000);
+    beat.unref();
+    joined.on("disconnected", () => clearInterval(beat));
+    // On the way out, close the tool's Flow window and the connect tab, so the user's Chrome doesn't collect a pair
+    // for every run (a new connection opens fresh ones). Never more than 3 s.
+    const tidy = () =>
+      void Promise.race([
+        Promise.allSettled(joined.contexts()[0]?.pages().map((p) => p.close()) ?? []),
+        new Promise((r) => setTimeout(r, 3000)),
+      ]).finally(() => process.exit(0));
+    process.once("SIGINT", tidy);
+    process.once("SIGTERM", tidy);
+    return joined;
+  } catch (err) {
+    throw new Error(`Could not connect through the Playwright Extension (${err instanceof Error ? err.message.split("\n")[0] : err}). ${EXTENSION_STEPS}`);
+  }
+}
+
+// Where the user's Chrome saves downloads: its own setting, else ~/Downloads. In extension mode Flow's files land here.
+export function usersDownloadDir(): string {
+  try {
+    const prefs = JSON.parse(readFileSync(join(CHROME_DATA_DIR, CONFIG.chrome_profile ?? "Default", "Preferences"), "utf8")) as {
+      download?: { default_directory?: string };
+    };
+    if (prefs.download?.default_directory) return prefs.download.default_directory;
+  } catch {
+    // the usual place below
+  }
+  return join(homedir(), "Downloads");
+}
+
 async function connect(): Promise<Browser> {
+  if (EXTENSION) return viaExtension();
   if (ATTACH) return attachToUsersChrome();
   if (!(await cdpUp())) await launchChrome();
   if (!ownsPort()) {
@@ -190,8 +263,45 @@ async function ownFlowTab(b: Browser): Promise<Page> {
   return (ownTab = tab);
 }
 
+// Through the extension the tool starts on the extension's connect page, a tab in the user's own window. Flow gets a
+// window of its own, opened from that page as a popup (the extension hands a connected tab's popups to the tool), so
+// the user's tabs are never switched and the tab the tool drives is the only one in its window. The connect page stays
+// open: it keeps the extension's side of the connection alive. If Chrome refuses the popup, the connect tab itself
+// becomes the Flow tab.
+async function extensionFlowTab(b: Browser): Promise<Page> {
+  if (ownTab && !ownTab.isClosed()) return ownTab;
+  const context = b.contexts()[0];
+  if (!context) throw new Error("The Playwright Extension connected but shows no tab to work in.");
+  for (const p of context.pages()) {
+    if (FLOW_HOSTS.test(p.url()) && (await p.evaluate(() => window.name).catch(() => "")) === OWN_TAB) return (ownTab = p);
+  }
+  const opener = context.pages()[0];
+  if (!opener) throw new Error("The Playwright Extension connected but shows no tab to work in.");
+  const opened = context.waitForEvent("page", { timeout: 15_000 }).catch(() => null);
+  await opener.mouse.click(4, 4).catch(() => {}); // a real click, so the page may open a window
+  const popped = await opener
+    .evaluate(
+      ([url, name]) =>
+        Boolean(window.open(url, name, `popup,width=${Math.min(1440, screen.availWidth)},height=${Math.min(900, screen.availHeight)}`)),
+      [FLOW_URL, OWN_TAB],
+    )
+    .catch(() => false);
+  let tab = popped ? await opened : null;
+  if (!tab) {
+    tab = opener;
+    await tab.goto(FLOW_URL, { waitUntil: "domcontentloaded" });
+  }
+  await tab.waitForLoadState("domcontentloaded");
+  // Chrome clears window.name when the popup moves on to another site (from the extension page to Flow): mark it now.
+  await tab.evaluate((mark) => {
+    window.name = mark;
+  }, OWN_TAB);
+  return (ownTab = tab);
+}
+
 export async function getFlowPage(): Promise<Page> {
   const b = await getBrowser();
+  if (EXTENSION) return extensionFlowTab(b);
   if (ATTACH) return ownFlowTab(b);
   const context = b.contexts()[0];
   if (!context) throw new Error("Chrome has no browser context; restart the Flow Chrome window.");

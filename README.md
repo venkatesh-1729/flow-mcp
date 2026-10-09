@@ -59,25 +59,38 @@ and leave the window open. The program never types your password — it only use
 created. That Chrome profile lives in `~/.flow-mcp/chrome-profile` and is separate from your
 everyday browser.
 
-### Or: use the Chrome you are already signed in to (attach mode)
+### Or: use the Chrome you are already signed in to (extension mode, no prompts)
 
-If Flow is already signed in in your everyday Chrome, the tool can work there instead (Chrome 144 or newer):
+If Flow is already signed in in your everyday Chrome, the tool can work there instead, through Microsoft's official
+Playwright Extension. Its token approves every connection, so nothing ever asks you to click:
 
-1. In that Chrome open `chrome://inspect/#remote-debugging` and turn on **Allow remote debugging for this browser
-   instance**. (Turn it off there whenever you like; while it is on, any app on this computer can *ask* to control
-   Chrome, and Chrome asks you first.)
-2. Tell every flow-mcp process to use it, once:
+1. Install the [Playwright Extension](https://chromewebstore.google.com/detail/playwright-extension/mmlmfjhmonkocbjadbfplnigmagldckm)
+   in that Chrome (in the profile signed in to Flow).
+2. Open its status page (toolbar puzzle piece → Playwright Extension), copy the token, and save it where only you can
+   read it (the copied `PLAYWRIGHT_MCP_EXTENSION_TOKEN=…` line is fine as it is):
    ```bash
-   mkdir -p ~/.flow-mcp && echo '{"browser": "attach"}' > ~/.flow-mcp/config.json
+   mkdir -p ~/.flow-mcp && pbpaste > ~/.flow-mcp/extension-token && chmod 600 ~/.flow-mcp/extension-token
    ```
-   (or set `FLOW_MCP_BROWSER=attach` in the environment of each launcher).
-3. On the first Flow call, Chrome asks whether to allow the connection: click **Allow**. The tool opens a Flow window of
-   its own and never touches your other tabs; leave that window open (it may sit behind others, but not minimised).
+3. Tell every flow-mcp process to use it, once (or set `FLOW_MCP_BROWSER=extension` in each launcher's environment;
+   `"chrome_profile"` picks a profile other than `Default`):
+   ```bash
+   echo '{"browser": "extension"}' > ~/.flow-mcp/config.json
+   ```
 
-Chrome asks again for every new connection. Keep one connection alive by leaving the panel running
-(`npm run studio`, or the Studio served by the first MCP session): every other MCP session then goes through it
-and nothing asks again. Your own downloads are untouched: the tool borrows a download folder only for its own file and
-gives it straight back.
+On the first Flow call a connect tab opens in a "Playwright · flow-mcp" tab group (it keeps the connection alive),
+Chrome shows "Playwright Extension started debugging this browser", and Flow opens in a small window of its own. The
+extension only reaches tabs the tool opens, never yours. Downloads land in your Downloads folder and are moved out at
+once; only a new file named after the item being fetched is ever taken. When the tool's process ends, it closes its
+window and the connect tab. The token lets programs on this computer drive tabs they open in your Chrome: keep it in
+that file and out of chats and git.
+
+**Sharing the screen.** Flow only works while its window is painted. When a job finds it covered by your own work, the
+tool waits until you pause for 6 seconds, then brings Chrome and the Flow window forward for the minute it needs (never
+mid-typing), and it re-reads the prompt before every Generate click so nothing you type can slip into it. A locked
+screen stops the job before anything is spent.
+
+The older attach mode (`{"browser": "attach"}`, with **Allow remote debugging for this browser instance** on at
+`chrome://inspect/#remote-debugging`, Chrome 144+) also works, but Chrome asks you to Allow every new connection.
 
 ---
 
@@ -247,6 +260,7 @@ key → Save key**. It's checked with Google before it's saved, and stored only 
 |---|---|
 | Mac: the server will not start, `EPERM: operation not permitted` | The folder is in a macOS-protected location. Move it out of `~/Desktop`, `~/Documents` or `~/Downloads` and update the path in your Claude config |
 | *"Not signed in"* or *"no project open"* | Run `npm run login`, sign in, leave the window open; open a project with `flow_project` |
+| Extension mode: *"Could not connect through the Playwright Extension"* | The extension is not in the Chrome profile signed in to Flow, or `~/.flow-mcp/extension-token` doesn't match its status page |
 | Attach mode: *"Could not attach to your Chrome"* | Chrome's Allow prompt went unanswered (it waits 5 minutes), or remote debugging is off at `chrome://inspect/#remote-debugging` |
 | *"Port 9339 is held by a Chrome that is not flow-mcp's own profile"* | Another automation Chrome holds the port. Close it, or set `FLOW_MCP_CDP_PORT` everywhere the tool starts |
 | A clip generated but no file arrived | The media is still in Flow. `flow_download` pulls it back for nothing — never re-generate and pay twice |

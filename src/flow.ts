@@ -2,9 +2,9 @@ import { closeSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, openSync, 
 import { homedir, tmpdir } from "node:os";
 import { basename, extname, join } from "node:path";
 import type { Locator, Page } from "playwright-core";
-import { ATTACH, DOWNLOAD_DIR, FLOW_URL, HOME_DIR, getFlowPage } from "./chrome.js";
+import { ATTACH, DOWNLOAD_DIR, EXTENSION, FLOW_URL, HOME_DIR, getFlowPage, usersDownloadDir } from "./chrome.js";
 import type { Job } from "./queue.js";
-import { extractZip } from "./platform.js";
+import { activateApp, extractZip, idleSeconds, screenLocked } from "./platform.js";
 
 export interface FlowState {
   url: string;
@@ -23,13 +23,20 @@ const VIDEO_TIMEOUT_MS = 12 * 60_000;
 const FAILURE_TEXT = /failed|couldn.t|unable/i;
 const OFF_SCREEN =
   "Flow's window is not on screen: the screen is locked or asleep, or the window is minimised or fully covered. Chrome paints nothing there, so nothing can be clicked. Unlock the screen and leave the Flow window at least partly visible. Nothing was spent.";
+// A job that finds Flow's window covered waits for the user to pause this long before bringing Chrome forward, and gives
+// up after WAIT_FOR_PAUSE_MS of the user working without a pause.
+const PAUSE_BEFORE_RAISE_S = 6;
+const WAIT_FOR_PAUSE_MS = 15 * 60_000;
 
 const pause = (page: Page, ms: number) => page.waitForTimeout(ms);
 
 // Chrome paints nothing for a window that is minimised, fully covered, or on a locked or sleeping screen, and then no
-// click lands: Playwright waits for an animation frame that never comes (2026-10-09, a locked laptop). A hidden window
-// is raised once; on a locked or sleeping screen it stays hidden, and the job stops before anything is spent.
-async function onScreen(page: Page): Promise<boolean> {
+// click lands: Playwright waits for an animation frame that never comes (2026-10-09, a locked laptop). A covered window
+// is raised inside Chrome first. In the user's own Chrome, on a laptop screen where their own app covers it, a job
+// (`patient`) then waits for the user to pause for a few seconds and brings Chrome forward for the minute it needs -
+// never while they are typing. A locked screen, or no pause within WAIT_FOR_PAUSE_MS, stops the job before anything is
+// spent.
+async function onScreen(page: Page, patient = false): Promise<boolean> {
   const painting = () =>
     page
       .evaluate(
@@ -46,20 +53,35 @@ async function onScreen(page: Page): Promise<boolean> {
   if (await painting()) return true;
   await page.bringToFront().catch(() => {});
   await pause(page, 1000);
-  return painting();
+  if (await painting()) return true;
+  if (!patient || !(ATTACH || EXTENSION)) return false;
+  const deadline = Date.now() + WAIT_FOR_PAUSE_MS;
+  while (Date.now() < deadline && !screenLocked()) {
+    const idle = idleSeconds();
+    if (idle === undefined) return false;
+    if (idle >= PAUSE_BEFORE_RAISE_S) {
+      activateApp("Google Chrome");
+      await page.bringToFront().catch(() => {});
+      await pause(page, 1500);
+      if (await painting()) return true;
+    }
+    await pause(page, 2000);
+  }
+  return false;
 }
 
 // `detailed` opens the account panel to read the balance, so it must not run while a generation is driving the page.
-export async function getFlowState(detailed = false): Promise<FlowState> {
+// `patient` (every job) waits for a pause in the user's own work to bring Flow's window forward; a status check never does.
+export async function getFlowState(detailed = false, patient = false): Promise<FlowState> {
   const page = await getFlowPage();
   const url = page.url();
   // Signed-out visitors are bounced to the marketing page or Google's sign-in.
   const signedIn = !/\/about|accounts\.google\.com/.test(url);
   const inProject = /\/project\//.test(url);
-  const state: FlowState = { url, signedIn, inProject, onScreen: await onScreen(page) };
+  const state: FlowState = { url, signedIn, inProject, onScreen: await onScreen(page, patient) };
   if (inProject) state.project = await projectTitle(page).inputValue({ timeout: 5000 }).catch(() => undefined);
   if (!signedIn) {
-    state.hint = ATTACH
+    state.hint = ATTACH || EXTENSION
       ? "Not signed in. Sign in to Flow in your own Chrome (the window flow-mcp opened), then call flow_status again."
       : "Not signed in. Run `npm run login` and sign in to Google in the Flow Chrome window.";
   } else if (!state.onScreen) state.hint = OFF_SCREEN;
@@ -99,7 +121,7 @@ async function homeProjects(page: Page): Promise<FlowProject[]> {
 // with a date for a name ("Oct 09 - 16:00"), so it is renamed in the top bar straight away.
 export async function openProject(title?: string, create = false): Promise<{ project?: FlowProject; created?: boolean; projects: FlowProject[] }> {
   const page = await getFlowPage();
-  if (!(await onScreen(page))) throw new Error(OFF_SCREEN);
+  if (!(await onScreen(page, true))) throw new Error(OFF_SCREEN);
   const was = page.url();
   const projects = await homeProjects(page);
   if (!title) {
@@ -444,14 +466,30 @@ async function attachAsset(page: Page, opener: Locator, assetName: string): Prom
   await pause(page, 500);
 }
 
+// The prompt as the box shows it, for comparing: one line, plain quotes and dashes (an editor may curl them).
+const plainText = (text: string) =>
+  text
+    .replace(/[‘’]/g, "'")
+    .replace(/[“”]/g, '"')
+    .replace(/[–—]/g, "-")
+    .replace(/\s+/g, " ")
+    .trim();
+
 async function typePrompt(page: Page, prompt: string): Promise<void> {
   const box = page.locator(".ProseMirror");
-  await box.click();
-  await page.keyboard.press("ControlOrMeta+a");
-  await page.keyboard.press("Delete");
   // Enter submits in Flow, so the prompt goes in as a single line.
-  await page.keyboard.type(prompt.replace(/\s*\n+\s*/g, " ").trim(), { delay: 8 });
-  await pause(page, 500);
+  const wanted = prompt.replace(/\s*\n+\s*/g, " ").trim();
+  for (let attempt = 0; attempt < 2; attempt++) {
+    await box.click();
+    await page.keyboard.press("ControlOrMeta+a");
+    await page.keyboard.press("Delete");
+    await page.keyboard.type(wanted, { delay: 8 });
+    await pause(page, 500);
+    // In the user's own Chrome the window may have been brought forward while they work, and anything they type then
+    // lands in the box and would be paid for. Go on only when the box holds exactly this prompt.
+    if (plainText(await box.innerText().catch(() => "")) === plainText(wanted)) return;
+  }
+  throw new Error("Flow's prompt box did not hold the prompt as typed (were keys typed into the Flow window?). Nothing was generated.");
 }
 
 export type DownloadQuality = "original" | "upscaled";
@@ -544,7 +582,39 @@ function handBack(guid: string, name: string): void {
 // goes to DOWNLOAD_DIR, which is watched for the new arrival. In the user's own Chrome (ATTACH) that folder is borrowed
 // for this one download only and the browser's normal behaviour is restored straight after; the file is picked out by
 // Chrome's own download events for the tool's tab, and anything the user downloads meanwhile is handed back.
-async function captureDownload(page: Page, start: () => Promise<void>, timeoutMs: number): Promise<string> {
+const slug = (text: string) => text.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+
+// Through the Playwright Extension Chrome saves Flow's file into the user's own Downloads folder (the extension cannot
+// redirect downloads), under Flow's name for it: the item's title, often followed by the size and a timestamp. Only a
+// file that is new and whose name starts with that title is taken, so nothing else the user downloads meanwhile can be
+// mistaken for it.
+async function fromUsersDownloads(page: Page, title: string | undefined, start: () => Promise<void>, timeoutMs: number): Promise<string> {
+  if (!title) throw new Error("This item has no title to find its download by; nothing was taken from your Downloads folder.");
+  const dir = usersDownloadDir();
+  const key = slug(title);
+  const ours = (file: string) => {
+    const name = slug(file.replace(/\.[^.]+$/, ""));
+    return name === key || name.startsWith(`${key}_`);
+  };
+  const before = new Set(existsSync(dir) ? readdirSync(dir) : []);
+  await start();
+  const deadline = Date.now() + timeoutMs;
+  let stable: { path: string; size: number } | undefined;
+  while (Date.now() < deadline) {
+    await pause(page, 1000);
+    const arrived = readdirSync(dir).filter((f) => !before.has(f) && !f.endsWith(".crdownload") && !f.startsWith(".") && ours(f));
+    for (const f of arrived) {
+      const path = join(dir, f);
+      const size = statSync(path).size;
+      if (stable?.path === path && stable.size === size && size > 0) return path;
+      stable = { path, size };
+    }
+  }
+  throw new Error(`Flow's download of "${title}" did not arrive in ${dir}. The media is still in Flow: flow_download fetches it again for free.`);
+}
+
+async function captureDownload(page: Page, start: () => Promise<void>, timeoutMs: number, title?: string): Promise<string> {
+  if (EXTENSION) return fromUsersDownloads(page, title, start, timeoutMs);
   if (!ATTACH) {
     await useOwnDownloadDir(page);
     const before = downloadsNow();
@@ -707,6 +777,7 @@ async function downloadTile(page: Page, target: Locator | TileResolver, targetSt
           }
         },
         quality === "upscaled" ? 600_000 : 180_000,
+        (await tile.getAttribute("aria-label").catch(() => null)) ?? undefined,
       );
       const kind = extensionOf(file);
       let saved: string[];
@@ -742,7 +813,7 @@ async function ensureProjectGrid(page: Page): Promise<void> {
 
 // Drives one generation in the Flow tab and returns the downloaded file paths.
 export async function runGeneration(job: Job): Promise<string[]> {
-  const state = await getFlowState();
+  const state = await getFlowState(false, true);
   if (!state.signedIn || !state.inProject || !state.onScreen) throw new Error(state.hint);
   const page = await getFlowPage();
   const s = job.params;
@@ -863,7 +934,7 @@ async function scanGrid(page: Page, stopAt?: (assets: FlowAsset[]) => boolean): 
 // Characters live in their own left-nav section. With none yet, Flow shows a template chooser instead, so only
 // entries that actually carry a character thumbnail count.
 export async function listCharacters(): Promise<string[]> {
-  const state = await getFlowState();
+  const state = await getFlowState(false, true);
   if (!state.signedIn || !state.inProject || !state.onScreen) throw new Error(state.hint);
   const page = await getFlowPage();
   await dismissOverlays(page);
@@ -912,6 +983,7 @@ async function savePortrait(page: Page, name: string): Promise<string> {
       if (!pressed) throw new Error("Flow never showed the portrait's Download image button");
     },
     90_000,
+    name,
   );
   const portrait = join(dir, `${name.replace(/[^\w.-]+/g, "_")}${extensionOf(file)}`);
   renameSync(file, portrait);
@@ -922,7 +994,7 @@ async function savePortrait(page: Page, name: string): Promise<string> {
 // Without a change it only saves the character's current portrait: for a look changed by hand in Flow, or an edit whose
 // portrait never reached disk.
 export async function editCharacter(name: string, change?: string, job?: Job): Promise<{ name: string; portrait?: string; note?: string }> {
-  const state = await getFlowState();
+  const state = await getFlowState(false, true);
   if (!state.signedIn || !state.inProject || !state.onScreen) throw new Error(state.hint);
   const page = await getFlowPage();
   await leaveCharacterEditor(page);
@@ -983,7 +1055,7 @@ export async function editCharacter(name: string, change?: string, job?: Job): P
 }
 
 export async function listAssets(): Promise<FlowAsset[]> {
-  const state = await getFlowState();
+  const state = await getFlowState(false, true);
   if (!state.signedIn || !state.inProject || !state.onScreen) throw new Error(state.hint);
   const page = await getFlowPage();
   const assets = await scanGrid(page);
@@ -993,7 +1065,7 @@ export async function listAssets(): Promise<FlowAsset[]> {
 
 // Downloads media that already exists in the project, matched by (the start of) its title.
 export async function downloadAsset(name: string, targetStem: string, quality: DownloadQuality): Promise<string[]> {
-  const state = await getFlowState();
+  const state = await getFlowState(false, true);
   if (!state.signedIn || !state.inProject || !state.onScreen) throw new Error(state.hint);
   const page = await getFlowPage();
   const matches = (a: FlowAsset) => a.name.toLowerCase().startsWith(name.toLowerCase());
@@ -1008,7 +1080,7 @@ export async function downloadAsset(name: string, targetStem: string, quality: D
 // "Move to trash" removes the tile at once), so whoever calls this must confirm with the user first. Matching is by
 // EXACT title, and an ambiguous title is refused: Flow reuses titles, and trashing the wrong one is the worst outcome.
 export async function trashAsset(name: string): Promise<{ trashed: string }> {
-  const state = await getFlowState();
+  const state = await getFlowState(false, true);
   if (!state.signedIn || !state.inProject || !state.onScreen) throw new Error(state.hint);
   const page = await getFlowPage();
   await ensureProjectGrid(page);
@@ -1040,7 +1112,7 @@ async function downloadScene(page: Page, scene: FlowAsset, targetStem: string): 
   else await tile.click();
   await page.waitForURL(/\/scene\//, { timeout: 30_000 });
   await pause(page, 3000);
-  const file = await captureDownload(page, () => page.getByRole("button", { name: "Download scene", exact: true }).click(), 600_000);
+  const file = await captureDownload(page, () => page.getByRole("button", { name: "Download scene", exact: true }).click(), 600_000, scene.name);
   const target = `${targetStem}${extensionOf(file)}`;
   renameSync(file, target);
   await page.getByRole("button", { name: "Back button to go to previous page" }).click().catch(() => {});
@@ -1078,7 +1150,7 @@ export function rememberCharacter(name: string, look: string): void {
 }
 
 export async function createCharacter(c: CharacterParams, job?: Job): Promise<{ name: string; url: string; portrait?: string }> {
-  const state = await getFlowState();
+  const state = await getFlowState(false, true);
   if (!state.signedIn || !state.inProject || !state.onScreen) throw new Error(state.hint);
   const page = await getFlowPage();
   // A description generates the portrait first (free image), then the character is built from that picture.
@@ -1179,7 +1251,7 @@ const EDIT_TIMEOUT_MS = 10 * 60_000;
 // Video-to-video edit in Flow's edit view ("make it sunset", "remove the cup"). Flow shows no quote here, so the
 // cost is measured from the balance instead (a 4 s Omni clip cost 20 credits). The result is a new tile.
 export async function runEdit(job: Job): Promise<string[]> {
-  const state = await getFlowState();
+  const state = await getFlowState(false, true);
   if (!state.signedIn || !state.inProject || !state.onScreen) throw new Error(state.hint);
   const page = await getFlowPage();
   const s = job.params;
@@ -1426,7 +1498,7 @@ async function agentRound(
 // demonstrated: save the clip's last frame, Animate that image (which switches Flow into agent mode by itself), then
 // add the avatar or character as a second chip. Verified step by step against the live UI on 2026-09-20.
 export async function runContinue(job: Job): Promise<string[]> {
-  const state = await getFlowState();
+  const state = await getFlowState(false, true);
   if (!state.signedIn || !state.inProject || !state.onScreen) throw new Error(state.hint);
   const page = await getFlowPage();
   const s = job.params;
@@ -1538,7 +1610,7 @@ export async function runContinue(job: Job): Promise<string[]> {
 }
 
 export async function runAgentBatch(job: Job): Promise<string[]> {
-  const state = await getFlowState();
+  const state = await getFlowState(false, true);
   if (!state.signedIn || !state.inProject || !state.onScreen) throw new Error(state.hint);
   const page = await getFlowPage();
   const s = job.params;

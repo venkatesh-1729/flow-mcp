@@ -92,6 +92,37 @@ export function keepDisplayAwake(): () => void {
   }
 }
 
+// Seconds since the user last touched the keyboard or mouse (macOS: the HID system's idle time), or undefined elsewhere.
+export function idleSeconds(): number | undefined {
+  if (!IS_MAC) return undefined;
+  try {
+    const out = execFileSync("ioreg", ["-c", "IOHIDSystem"], { encoding: "utf8", timeout: 5000, maxBuffer: 8 * 1024 * 1024 });
+    const ns = out.match(/"HIDIdleTime"\s*=\s*(\d+)/)?.[1];
+    return ns ? Number(ns) / 1e9 : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+// Whether the Mac's screen is locked (the login window is up), when it can be told.
+export function screenLocked(): boolean {
+  if (!IS_MAC) return false;
+  try {
+    return /CGSSessionScreenIsLocked<\/key>\s*<true\/>/.test(execFileSync("ioreg", ["-n", "Root", "-d1", "-a"], { encoding: "utf8", timeout: 5000 }));
+  } catch {
+    return false;
+  }
+}
+
+// Brings an app to the front (macOS `open -a`, which needs no permission, unlike AppleScript).
+export function activateApp(name: string): void {
+  try {
+    if (IS_MAC) execFileSync("open", ["-a", name], { stdio: "ignore", timeout: 10_000 });
+  } catch {
+    // the caller checks whether it worked
+  }
+}
+
 // The command line of the process listening on a local TCP port, or undefined when it cannot be told (no lsof, no
 // PowerShell networking cmdlets, nothing listening).
 export function listenerCommandLine(port: number): string | undefined {

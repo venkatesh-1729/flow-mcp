@@ -1,14 +1,23 @@
 # flow-mcp
 
-Local MCP server (stdio, TypeScript) that drives Google Flow over CDP (`playwright-core`, `connectOverCDP`). No
-extension. Two browsers, chosen by `FLOW_MCP_BROWSER` or `~/.flow-mcp/config.json` (`{"browser": "attach"}`), which
-every process (MCP server, Studio, scripts) reads alike:
-- default: a dedicated Chrome profile the tool launches itself (`~/.flow-mcp/chrome-profile`, CDP port 9339 - 9333
-  clashed with the Jev pilot's Chrome);
-- `attach`: the user's own running Chrome, already signed in, through Chrome 144+'s "Allow remote debugging for this
-  browser instance" (chrome://inspect/#remote-debugging). The address comes from `DevToolsActivePort` in Chrome's data
-  folder; Chrome asks the user to Allow EVERY new connection, so one long-lived owner process (Studio) saves prompts.
-  The tool works in a window of its own there (tab marked `window.name = "flow-mcp"`), never in the user's tabs.
+Local MCP server (stdio, TypeScript) that drives Google Flow over CDP (`playwright-core`, `connectOverCDP`). Three
+browsers, chosen by `FLOW_MCP_BROWSER` or `~/.flow-mcp/config.json` (`{"browser": ...}`), which every process (MCP
+server, Studio, scripts) reads alike:
+- default (`own`): a dedicated Chrome profile the tool launches itself (`~/.flow-mcp/chrome-profile`, CDP port 9339 -
+  9333 clashed with the Jev pilot's Chrome);
+- `extension` (the user's choice, 9 Oct): the user's everyday Chrome, signed in, through Microsoft's Playwright
+  Extension (id mmlmfjhmonkocbjadbfplnigmagldckm) and Playwright's own relay for it (`tools.createBrowserWithInfo` from
+  `playwright-core/lib/coreBundle`, internal API, hence playwright-core pinned to 1.63.0). The token in
+  `~/.flow-mcp/extension-token` approves connections: no prompts. The extension reaches only tabs the tool opens (and
+  their popups); `Browser.setDownloadBehavior` is a no-op through it, so downloads land in the user's Downloads folder
+  and are picked by the item's title. Flow opens as a popup window from the connect page, which stays open (it keeps
+  the extension's worker alive), plus a 20 s keepalive; SIGINT/SIGTERM close both;
+- `attach`: the everyday Chrome through Chrome 144+'s "Allow remote debugging for this browser instance"
+  (chrome://inspect/#remote-debugging), address from `DevToolsActivePort`. Chrome asks the user to Allow EVERY new
+  connection (by design, no remember option), which the user would not accept.
+In the user's Chrome the tool works in a window of its own (marked `window.name = "flow-mcp"`), never in the user's tabs.
+Jobs that find that window covered wait for a 6 s pause in the user's input (HIDIdleTime) and then bring Chrome forward
+(`open -a`); typePrompt re-reads the box before Generate.
 Goal: feature parity with OmniFlow (lingoflow.pro/omniflow), using subscription credits instead of the API.
 
 - `src/chrome.ts` launch/attach Chrome · `src/flow.ts` UI driver · `src/queue.ts` paced job queue
@@ -22,7 +31,8 @@ Goal: feature parity with OmniFlow (lingoflow.pro/omniflow), using subscription 
 
 - Never guess selectors. Map them from the live page (`ariaSnapshot`, DOM dump) before writing driver code.
 - Anything that spends credits needs the user's OK first. Images (Nano Banana 2) cost 0 and exercise the same pipeline.
-- Never enter Google credentials; the user signs in by hand (`npm run login`, or in their own Chrome in attach mode).
+- Never enter Google credentials; the user signs in by hand (`npm run login`, or in their own Chrome). Never read, print
+  or commit the extension token; only its file holds it.
 - No bot-detection evasion. The page has invisible reCAPTCHA; we only drive the real UI at human pace.
 - MCP FIRST. When a new Flow capability or workaround is learned, build it into the MCP before using it for the task at
   hand: hand-driving a path once and moving on is not acceptable, the next run must be able to do it through the tools.
