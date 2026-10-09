@@ -5,7 +5,7 @@ import { z } from "zod";
 import { assemble, localVoices, speakLocally } from "./assemble.js";
 import { GEMINI_VOICES, geminiKey, saveGeminiKey, speakWithGemini } from "./gemini.js";
 import { extractLastFrame } from "./chain.js";
-import { characterLook, createCharacter, downloadAsset, trashAsset, editCharacter, getFlowState, listAssets, listCharacters, rememberCharacter, runAgentBatch, runContinue, runEdit, runGeneration } from "./flow.js";
+import { characterLook, createCharacter, downloadAsset, trashAsset, editCharacter, getFlowState, listAssets, listCharacters, openProject, rememberCharacter, runAgentBatch, runContinue, runEdit, runGeneration } from "./flow.js";
 import { JobQueue, type Job } from "./queue.js";
 import { BIN, COMPUTER, IS_MAC, IS_WIN, moveToBin } from "./platform.js";
 import { TECHNIQUES, techniqueById } from "./techniques.js";
@@ -13,17 +13,26 @@ import { TECHNIQUES, techniqueById } from "./techniques.js";
 export const OUTPUT_ROOT = process.env.FLOW_MCP_OUTPUT ?? join(homedir(), "flow-mcp-out");
 const words = (s: string) => s.split(/[^a-z0-9]+/i).filter((w) => w.length > 3).map((w) => w.toLowerCase());
 
-export const projectDir = (project: string) => resolve(OUTPUT_ROOT, project.replace(/[^\w.-]+/g, "_"));
+// A plain name is a folder under the output root; an absolute path is used as given, so a film's clips can land straight
+// in the film's own folder.
+export const projectDir = (project: string) => (isAbsolute(project) ? resolve(project) : resolve(OUTPUT_ROOT, project.replace(/[^\w.-]+/g, "_")));
 
 const sceneSchema = z.object({
   prompt: z.string().min(1).describe("Full English prompt for one clip: action, shot and camera move, location, style, light, sound."),
+  name: z
+    .string()
+    .regex(/^[\w.-]{1,80}$/, "letters, digits, '.', '_' and '-' only")
+    .optional()
+    .describe(
+      "File name for this scene's result instead of scene-NN, e.g. a shot id like 'i101'; the tile in Flow is renamed to it too. A name already used in the folder gets -take2, -take3 and so on, so nothing is overwritten.",
+    ),
   type: z.enum(["video", "image"]).default("video"),
   model: z
     .string()
     .optional()
     .describe("Model label as shown in Flow, e.g. 'Omni 1.1 Flash', 'Veo 3.1 - Fast', 'Veo 3.1 - Quality', 'Nano Banana 2'. Omit to keep Flow's current model."),
   aspect_ratio: z.enum(["16:9", "9:16", "1:1", "4:3", "3:4"]).optional().describe("Video supports 16:9 and 9:16 only."),
-  duration: z.union([z.literal(4), z.literal(6), z.literal(8), z.literal(10)]).optional().describe("Video length in seconds. Omni models only; Veo 3.1 clips are fixed at 8s."),
+  duration: z.union([z.literal(4), z.literal(6), z.literal(8), z.literal(10)]).optional().describe("Video length in seconds: Omni 4/6/8/10, Veo 3.1 4/6/8 (Oct 2026)."),
   resolution: z.enum(["360p", "720p"]).optional().describe("Video resolution. Omni models only."),
   max_credits: z.number().int().min(0).default(25).describe("Safety cap: the scene is skipped (nothing spent) if Flow quotes more credits than this."),
   variants: z.number().int().min(1).max(4).optional().describe("Outputs per prompt (each one spends credits). Default 1."),
@@ -53,7 +62,7 @@ const sceneSchema = z.object({
 export const shapes = {
   status: { detailed: z.boolean().default(true).describe("false skips the plan/credits readout, which briefly opens Flow's account panel.") },
   generate: {
-    project: z.string().min(1).describe("Folder name for the downloaded clips, e.g. 'HotelPromo'."),
+    project: z.string().min(1).describe("Folder name for the downloaded clips under the output root, e.g. 'HotelPromo', or an absolute folder path."),
     scenes: z.array(sceneSchema).min(1).max(100),
   },
   wait: {
@@ -137,6 +146,10 @@ export const shapes = {
       .describe("Skip the guard that refuses to run when Flow already holds a fresh-looking continuation of this clip. Only pass it when you have checked the grid and genuinely want another paid take."),
   },
   trash: { name: z.string().min(1).describe("Exact title of the item to move to Flow's Trash, as listed by flow_assets.") },
+  open_project: {
+    title: z.string().min(1).max(100).optional().describe("Exact title of the Flow project to open, e.g. 'TS · Ananthalwar'. Leave out to only list the projects."),
+    create: z.boolean().default(false).describe("Create the project (free) when none has this title."),
+  },
   set_key: { key: z.string().min(1).max(200) },
   discard: { path: z.string().min(1).describe("A saved film, still, narration or whole project folder inside the films folder, to move to this computer's bin (Mac Trash, Windows Recycle Bin).") },
   outputs: {},
@@ -213,6 +226,7 @@ export interface Core {
   character_edit(a: Args<"character_edit">): Promise<unknown>;
   edit(a: Args<"edit">): Promise<unknown>;
   trash(a: Args<"trash">): Promise<unknown>;
+  open_project(a: Args<"open_project">): Promise<unknown>;
   discard(a: Args<"discard">): Promise<unknown>;
   set_key(a: Args<"set_key">): Promise<unknown>;
   continue_shot(a: Args<"continue_shot">): Promise<unknown>;
@@ -277,11 +291,19 @@ export class LocalCore implements Core {
 
     const output_dir = projectDir(project);
     // Continue numbering after whatever is already on disk or queued, so reruns never overwrite earlier scenes.
-    const onDisk = existsSync(output_dir) ? readdirSync(output_dir).map((f) => Number(f.match(/^scene-(\d+)/)?.[1] ?? 0)) : [];
-    const queued = this.queue.list().filter((j) => j.params.output_dir === output_dir).map((j) => Number(j.params.file_stem.match(/\d+/)?.[0] ?? 0));
+    const files = existsSync(output_dir) ? readdirSync(output_dir) : [];
+    const onDisk = files.map((f) => Number(f.match(/^scene-(\d+)/)?.[1] ?? 0));
+    const queued = this.queue.list().filter((j) => j.params.output_dir === output_dir).map((j) => Number(j.params.file_stem.match(/^scene-(\d+)/)?.[1] ?? 0));
     const offset = Math.max(0, ...onDisk, ...queued);
     const jobs: Job[] = [];
-    for (const [i, { chain_previous, reference_previous, technique, ...scene }] of scenes.entries()) {
+    // A named scene keeps its name unless something in the folder, the queue or this call already has it.
+    const taken = (stem: string) =>
+      files.some((f) => f.startsWith(`${stem}.`) || f.startsWith(`${stem}-v`)) ||
+      [...this.queue.list(), ...jobs].some((j) => j.params.output_dir === output_dir && j.params.file_stem === stem);
+    let unnamed = 0;
+    for (const [i, { chain_previous, reference_previous, technique, name, ...scene }] of scenes.entries()) {
+      let file_stem = name ?? `scene-${String(offset + ++unnamed).padStart(2, "0")}`;
+      for (let take = 2; name && taken(file_stem); take++) file_stem = `${name}-take${take}`;
       const phrase = technique ? techniqueById(technique)!.phrase : "";
       // A referenced character must come out identical, not merely similar, so the scene says so explicitly. The
       // wording stays medium-neutral: the same lock has to serve a flat cartoon character and a photoreal avatar.
@@ -304,7 +326,8 @@ export class LocalCore implements Core {
           chain_from: chain_previous ? jobs[i - 1].id : undefined,
           reference_from: reference_previous ? jobs[i - 1].id : undefined,
           output_dir,
-          file_stem: `scene-${String(offset + i + 1).padStart(2, "0")}`,
+          file_stem,
+          named: Boolean(name),
         }),
       );
     }
@@ -460,6 +483,14 @@ export class LocalCore implements Core {
   async trash({ name }: Args<"trash">) {
     if (this.queue.busy) throw new Error(BUSY);
     return trashAsset(name);
+  }
+
+  // Switching projects under a queued job would send its scenes to the wrong project, so the queue must be empty.
+  async open_project({ title, create }: Args<"open_project">) {
+    if (title && this.queue.list().some((j) => j.status === "queued" || j.status === "running")) {
+      throw new Error("Jobs are queued or running in the open project. Wait for them (flow_wait) before switching projects.");
+    }
+    return openProject(title, create);
   }
 
   async character(a: Args<"character">) {

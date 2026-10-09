@@ -1,8 +1,15 @@
 # flow-mcp
 
-Local MCP server (stdio, TypeScript) that drives Google Flow in a dedicated Chrome profile over CDP
-(`playwright-core`, `connectOverCDP` on port 9333). No extension. Goal: feature parity with
-OmniFlow (lingoflow.pro/omniflow), using subscription credits instead of the API.
+Local MCP server (stdio, TypeScript) that drives Google Flow over CDP (`playwright-core`, `connectOverCDP`). No
+extension. Two browsers, chosen by `FLOW_MCP_BROWSER` or `~/.flow-mcp/config.json` (`{"browser": "attach"}`), which
+every process (MCP server, Studio, scripts) reads alike:
+- default: a dedicated Chrome profile the tool launches itself (`~/.flow-mcp/chrome-profile`, CDP port 9339 - 9333
+  clashed with the Jev pilot's Chrome);
+- `attach`: the user's own running Chrome, already signed in, through Chrome 144+'s "Allow remote debugging for this
+  browser instance" (chrome://inspect/#remote-debugging). The address comes from `DevToolsActivePort` in Chrome's data
+  folder; Chrome asks the user to Allow EVERY new connection, so one long-lived owner process (Studio) saves prompts.
+  The tool works in a window of its own there (tab marked `window.name = "flow-mcp"`), never in the user's tabs.
+Goal: feature parity with OmniFlow (lingoflow.pro/omniflow), using subscription credits instead of the API.
 
 - `src/chrome.ts` launch/attach Chrome · `src/flow.ts` UI driver · `src/queue.ts` paced job queue
 - `src/core.ts` all tool logic + zod shapes (LocalCore) · `src/server.ts` localhost HTTP API + Studio page ·
@@ -15,12 +22,43 @@ OmniFlow (lingoflow.pro/omniflow), using subscription credits instead of the API
 
 - Never guess selectors. Map them from the live page (`ariaSnapshot`, DOM dump) before writing driver code.
 - Anything that spends credits needs the user's OK first. Images (Nano Banana 2) cost 0 and exercise the same pipeline.
-- Never enter Google credentials; the user signs in by hand via `npm run login`.
+- Never enter Google credentials; the user signs in by hand (`npm run login`, or in their own Chrome in attach mode).
 - No bot-detection evasion. The page has invisible reCAPTCHA; we only drive the real UI at human pace.
-- MCP FIRST, ALWAYS. When a new Flow capability or workaround is learned, build it into the MCP before using it for
-  the task at hand, and do not ask whether to - the user has made this standing. Hand-driving a path once and moving
-  on is not acceptable: the next run must be able to do it through the tools. Map the selectors live, wire the
-  feature in, rebuild, then carry on with the user's actual request.
+- MCP FIRST. When a new Flow capability or workaround is learned, build it into the MCP before using it for the task at
+  hand: hand-driving a path once and moving on is not acceptable, the next run must be able to do it through the tools.
+  Map the selectors live, wire the feature in, rebuild, then carry on with the user's actual request. Say what you are
+  adding as you go, and ask first when the change spends credits, deletes anything or touches the user's own browser
+  beyond the tool's window.
+- Downloads land only in `~/.flow-mcp/downloads`, never by watching `~/Downloads` (that took the user's own files).
+  In attach mode the folder is borrowed per download through `Browser.setDownloadBehavior` and given back straight
+  after; the file is picked by `Browser.downloadWillBegin`'s frameId, and the user's own downloads are handed back.
+
+## Flow UI changes seen 2026-10-09 (Ultra plan, en-GB Chrome, attach mode)
+
+- Home page: project cards = `link "Open project"` (href `/project/<uuid>`) beside the title as a bare text node, plus
+  `Edit project title` and `Delete project` buttons; FAB `New project` creates a project named by date ("Oct 09 - 16:00")
+  and opens it. Inside a project the title is `textbox "Editable text"` (an `<input>`: read it with inputValue, rename
+  with select-all + type + Enter). `flow_project` uses both.
+- `Account details` reads "ULTRA"; the image default is now `🍌 Nano Banana 2.1`.
+- Video models: Omni 1.1 Flash (360p/720p, 4/6/8/10 s), Veo 3.1 - Lite / - Fast / - Quality (4/6/8 s, no resolution
+  radio). Quotes x1: Omni 720p 8 s 12 · Lite 5 · Fast 10 (flat).
+- In an en-GB browser the left nav says `Bin`, not `Trash`: anything matching "Trash" text must be checked against the
+  user's locale (flow_trash's menu item is unverified there).
+- Frames mode composer: `Start`, `Swap first and last frames`, `End`. Add media menu: Upload, New collection, Create
+  character, New scene.
+- An upload shows in the grid at once (title only, "99%"), but the Start/End/ingredient pickers list it only once it is
+  stored and its tile has `img[data-media-id]` (src `flow-content.google/image/<uuid>`): uploadAsset waits for that,
+  attachAsset reopens the picker up to 5 times.
+- A clip is titled WHILE it renders ("Camera pushing in on deity 19%"), so a title no longer means finished:
+  waitForNewMedia counts a new tile only once no new tile shows NN%. (Before the fix a 10-credit clip was taken as done
+  at 19% and the download failed; it was fetched afterwards.)
+- A hidden page (locked or sleeping screen, minimised or fully covered window) has `visibilityState: hidden` and no
+  animation frames, so every Playwright click waits forever. getFlowState reports `onScreen` (one requestAnimationFrame
+  within 1 s, after one bringToFront); every UI entry point refuses with OFF_SCREEN instead; the queue holds
+  `caffeinate -d` while it works (macOS).
+- Verified 2026-10-09 in attach mode: flow_status, flow_project (open + create), flow_generate with a local first frame
+  (Omni 1.1 Flash 6 s and Veo 3.1 Fast 8 s, 10 credits each, balance 10,050 → 10,030), rename to the scene name, the free
+  1080p and 720p downloads (only into ~/.flow-mcp/downloads; ~/Downloads untouched), flow_assets, flow_wait task ids.
 
 ## Flow UI map (verified 2026-09-19, flow.google.com, Pro plan)
 

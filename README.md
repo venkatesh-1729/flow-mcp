@@ -59,6 +59,26 @@ and leave the window open. The program never types your password — it only use
 created. That Chrome profile lives in `~/.flow-mcp/chrome-profile` and is separate from your
 everyday browser.
 
+### Or: use the Chrome you are already signed in to (attach mode)
+
+If Flow is already signed in in your everyday Chrome, the tool can work there instead (Chrome 144 or newer):
+
+1. In that Chrome open `chrome://inspect/#remote-debugging` and turn on **Allow remote debugging for this browser
+   instance**. (Turn it off there whenever you like; while it is on, any app on this computer can *ask* to control
+   Chrome, and Chrome asks you first.)
+2. Tell every flow-mcp process to use it, once:
+   ```bash
+   mkdir -p ~/.flow-mcp && echo '{"browser": "attach"}' > ~/.flow-mcp/config.json
+   ```
+   (or set `FLOW_MCP_BROWSER=attach` in the environment of each launcher).
+3. On the first Flow call, Chrome asks whether to allow the connection: click **Allow**. The tool opens a Flow window of
+   its own and never touches your other tabs; leave that window open (it may sit behind others, but not minimised).
+
+Chrome asks again for every new connection. Keep one connection alive by leaving the panel running
+(`npm run studio`, or the Studio served by the first MCP session): every other MCP session then goes through it
+and nothing asks again. Your own downloads are untouched: the tool borrows a download folder only for its own file and
+gives it straight back.
+
 ---
 
 ## Connect it to Claude or Codex
@@ -167,8 +187,9 @@ agree on what is running. That API listens on 127.0.0.1 only and needs a per-run
 
 | Tool | Purpose |
 |---|---|
-| `flow_status` | Session state (signed in, project open, plan, credits left), queue, pacing, prompt playbook |
-| `flow_generate` | Queue scenes: prompt, image or video, model, aspect, duration, resolution, variants, first/last frame, reference images, `max_credits` cap |
+| `flow_status` | Session state (signed in, which project is open, plan, credits left), queue, pacing, prompt playbook |
+| `flow_project` | Open a project by its exact title, or create it (free) with `create: true`; with no title, list the projects |
+| `flow_generate` | Queue scenes: prompt, image or video, model, aspect, duration, resolution, variants, first/last frame, reference images, `max_credits` cap, and an optional `name` (file name and Flow title, e.g. a shot id) |
 | `flow_wait` | Wait for jobs, or for the task id of a slow call; returns file paths and results. Answers within about 40 s, so call again until `finished` is true |
 | `flow_cancel` | Cancel a job that has not started |
 | `flow_retry` | Re-queue failed jobs with the same settings and file names (a failed tile is first retried inside Flow with its own free Retry button: `retries`, default 1) |
@@ -192,7 +213,10 @@ character or product consistent). Flow's *composer* takes either frames or refer
 when you need a start frame **and** a character locked together, use `flow_continue`, which goes through
 Flow's agent mode and does both.
 
-Output lands in `~/flow-mcp-out/<project>/scene-NN.ext`.
+Output lands in `~/flow-mcp-out/<project>/scene-NN.ext`, or `<name>.ext` for a named scene (a name already used gets
+`-take2`, `-take3`). `project` can also be an absolute folder path, to save straight into a film's own folder.
+`download_quality: "upscaled"` fetches the free upscale (1080p for a clip, 2K for a still) and never the 4K one, which
+costs credits on a clip.
 
 ### Narration with Google's voices (optional)
 
@@ -210,16 +234,21 @@ key → Save key**. It's checked with Google before it's saved, and stored only 
   invisible reCAPTCHA; this drives the real interface at human pace and does nothing to evade it.
 - Before each generation the server reads Flow's own credit quote and skips the scene if it exceeds
   `max_credits` (default 25).
+- Downloads go only to `~/.flow-mcp/downloads` and are then moved into the project folder; `~/Downloads` is never
+  watched, so nothing of yours is ever picked up by mistake.
 - Environment variables: `GEMINI_API_KEY`, `FLOW_MCP_PORT` (8787), `FLOW_MCP_OUTPUT`,
-  `FLOW_MCP_HOME`, `FLOW_MCP_CDP_PORT` (9333), `FLOW_MCP_CHROME`, `FLOW_MCP_PAUSE_MIN_S`,
-  `FLOW_MCP_PAUSE_MAX_S`.
+  `FLOW_MCP_HOME`, `FLOW_MCP_CDP_PORT` (9339), `FLOW_MCP_CHROME`, `FLOW_MCP_PAUSE_MIN_S`,
+  `FLOW_MCP_PAUSE_MAX_S`, `FLOW_MCP_BROWSER` (`attach` = your own Chrome; also settable in `~/.flow-mcp/config.json`),
+  `FLOW_MCP_CHROME_DATA` (that Chrome's data folder, if not the default).
 
 ## If something goes wrong
 
 | Symptom | Cause |
 |---|---|
 | Mac: the server will not start, `EPERM: operation not permitted` | The folder is in a macOS-protected location. Move it out of `~/Desktop`, `~/Documents` or `~/Downloads` and update the path in your Claude config |
-| *"Not signed in"* or *"no project open"* | Run `npm run login`, sign in, open a Flow project, leave the window open |
+| *"Not signed in"* or *"no project open"* | Run `npm run login`, sign in, leave the window open; open a project with `flow_project` |
+| Attach mode: *"Could not attach to your Chrome"* | Chrome's Allow prompt went unanswered (it waits 5 minutes), or remote debugging is off at `chrome://inspect/#remote-debugging` |
+| *"Port 9339 is held by a Chrome that is not flow-mcp's own profile"* | Another automation Chrome holds the port. Close it, or set `FLOW_MCP_CDP_PORT` everywhere the tool starts |
 | A clip generated but no file arrived | The media is still in Flow. `flow_download` pulls it back for nothing — never re-generate and pay twice |
 | Everything times out | The Chrome window was closed, or the machine slept. Reopen it with `npm run login` |
 

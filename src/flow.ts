@@ -2,7 +2,7 @@ import { closeSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, openSync, 
 import { homedir, tmpdir } from "node:os";
 import { basename, extname, join } from "node:path";
 import type { Locator, Page } from "playwright-core";
-import { HOME_DIR, getFlowPage } from "./chrome.js";
+import { ATTACH, DOWNLOAD_DIR, FLOW_URL, HOME_DIR, getFlowPage } from "./chrome.js";
 import type { Job } from "./queue.js";
 import { extractZip } from "./platform.js";
 
@@ -10,6 +10,8 @@ export interface FlowState {
   url: string;
   signedIn: boolean;
   inProject: boolean;
+  onScreen: boolean;
+  project?: string;
   plan?: string;
   credits_remaining?: number;
   composer?: string;
@@ -19,8 +21,33 @@ export interface FlowState {
 const IMAGE_TIMEOUT_MS = 3 * 60_000;
 const VIDEO_TIMEOUT_MS = 12 * 60_000;
 const FAILURE_TEXT = /failed|couldn.t|unable/i;
+const OFF_SCREEN =
+  "Flow's window is not on screen: the screen is locked or asleep, or the window is minimised or fully covered. Chrome paints nothing there, so nothing can be clicked. Unlock the screen and leave the Flow window at least partly visible. Nothing was spent.";
 
 const pause = (page: Page, ms: number) => page.waitForTimeout(ms);
+
+// Chrome paints nothing for a window that is minimised, fully covered, or on a locked or sleeping screen, and then no
+// click lands: Playwright waits for an animation frame that never comes (2026-10-09, a locked laptop). A hidden window
+// is raised once; on a locked or sleeping screen it stays hidden, and the job stops before anything is spent.
+async function onScreen(page: Page): Promise<boolean> {
+  const painting = () =>
+    page
+      .evaluate(
+        () =>
+          new Promise<boolean>((ok) => {
+            const late = setTimeout(() => ok(false), 1000);
+            requestAnimationFrame(() => {
+              clearTimeout(late);
+              ok(true);
+            });
+          }),
+      )
+      .catch(() => false);
+  if (await painting()) return true;
+  await page.bringToFront().catch(() => {});
+  await pause(page, 1000);
+  return painting();
+}
 
 // `detailed` opens the account panel to read the balance, so it must not run while a generation is driving the page.
 export async function getFlowState(detailed = false): Promise<FlowState> {
@@ -29,15 +56,78 @@ export async function getFlowState(detailed = false): Promise<FlowState> {
   // Signed-out visitors are bounced to the marketing page or Google's sign-in.
   const signedIn = !/\/about|accounts\.google\.com/.test(url);
   const inProject = /\/project\//.test(url);
-  const state: FlowState = { url, signedIn, inProject };
-  if (!signedIn) state.hint = "Not signed in. Run `npm run login` and sign in to Google in the Flow Chrome window.";
-  else if (!inProject) state.hint = "Signed in, but no project is open. Open or create a project in the Flow Chrome window.";
+  const state: FlowState = { url, signedIn, inProject, onScreen: await onScreen(page) };
+  if (inProject) state.project = await projectTitle(page).inputValue({ timeout: 5000 }).catch(() => undefined);
+  if (!signedIn) {
+    state.hint = ATTACH
+      ? "Not signed in. Sign in to Flow in your own Chrome (the window flow-mcp opened), then call flow_status again."
+      : "Not signed in. Run `npm run login` and sign in to Google in the Flow Chrome window.";
+  } else if (!state.onScreen) state.hint = OFF_SCREEN;
+  else if (!inProject) state.hint = "Signed in, but no project is open. Open or create one with flow_project.";
   else if (detailed) {
     state.plan = await page.getByRole("button", { name: "Account details" }).innerText().then((t) => t.trim().split("\n")[0], () => undefined);
     state.credits_remaining = await readCredits(page).catch(() => undefined);
     state.composer = await settingsTrigger(page).innerText().then((t) => t.replace(/\s+/g, " ").trim(), () => undefined);
   }
   return state;
+}
+
+// Inside a project the title sits in the top bar as an editable text box (mapped 2026-10-09).
+const projectTitle = (page: Page) => page.getByRole("textbox", { name: "Editable text" }).first();
+
+export interface FlowProject {
+  title: string;
+  url: string;
+}
+
+// The project cards on Flow's home page: an "Open project" link beside the title text and its "Edit project title"
+// button (mapped 2026-10-09). The title is the card's own text node, not innerText, which also holds icon ligatures.
+async function homeProjects(page: Page): Promise<FlowProject[]> {
+  await page.goto(FLOW_URL, { waitUntil: "domcontentloaded" });
+  await page.getByRole("button", { name: "New project" }).waitFor({ state: "visible", timeout: 30_000 });
+  await pause(page, 1500);
+  return page.evaluate(() =>
+    [...document.querySelectorAll('a[aria-label="Open project"][href*="/project/"]')].map((a) => {
+      const edit = a.parentElement?.querySelector('button[aria-label="Edit project title"]');
+      const title = edit ? [...(edit.parentElement?.childNodes ?? [])].filter((n) => n.nodeType === 3).map((n) => n.textContent ?? "").join("").trim() : "";
+      return { title, url: new URL(a.getAttribute("href") ?? "", location.origin).toString() };
+    }),
+  );
+}
+
+// Lists the projects, or opens the one with this exact title - creating it (free) when asked. A new project starts
+// with a date for a name ("Oct 09 - 16:00"), so it is renamed in the top bar straight away.
+export async function openProject(title?: string, create = false): Promise<{ project?: FlowProject; created?: boolean; projects: FlowProject[] }> {
+  const page = await getFlowPage();
+  if (!(await onScreen(page))) throw new Error(OFF_SCREEN);
+  const was = page.url();
+  const projects = await homeProjects(page);
+  if (!title) {
+    // Listing passes through the home page; put back the project that was open, so the next job still has one.
+    if (/\/project\//.test(was)) await page.goto(was, { waitUntil: "domcontentloaded" });
+    return { projects };
+  }
+  const same = projects.filter((p) => p.title === title);
+  if (same.length > 1) throw new Error(`${same.length} projects are called "${title}", so it isn't clear which to open. Rename one in Flow first.`);
+  if (same.length) {
+    await page.goto(same[0].url, { waitUntil: "domcontentloaded" });
+    await page.getByRole("navigation", { name: "Project navigation" }).waitFor({ state: "visible", timeout: 30_000 });
+    return { project: same[0], created: false, projects };
+  }
+  if (!create) throw new Error(`No project is called "${title}". Pass create: true to make it, or pick one of: ${projects.map((p) => p.title).join(", ")}.`);
+  await page.getByRole("button", { name: "New project" }).click();
+  await page.waitForURL(/\/project\/[0-9a-f-]{36}/, { timeout: 30_000 });
+  const box = projectTitle(page);
+  await box.waitFor({ state: "visible", timeout: 20_000 });
+  await box.click();
+  await page.keyboard.press("ControlOrMeta+a");
+  await page.keyboard.type(title, { delay: 20 });
+  await page.keyboard.press("Enter");
+  await pause(page, 2000);
+  const named = await box.inputValue();
+  if (named !== title) throw new Error(`Created a project at ${page.url()}, but Flow kept the title "${named}". Rename it there.`);
+  const project = { title, url: page.url() };
+  return { project, created: true, projects: [project, ...projects] };
 }
 
 // Menus close on Escape; the account panel does not and needs its own close button.
@@ -194,9 +284,20 @@ async function waitForNewMedia(page: Page, before: string[], count: number, time
   let failures = 0;
   while (Date.now() < deadline) {
     await pause(page, 2000);
-    const fresh = [...new Set((await mediaIds(page)).filter((id) => !before.includes(id)))];
-    // New tiles are listed first, so anything beyond the requested count is not ours.
-    if (fresh.length >= count) return fresh.slice(0, count);
+    const tiles = await page.evaluate(
+      (js) =>
+        [...document.querySelectorAll("flow-grid-tile-container")].map((t) => ({
+          id: (eval(js) as (t: Element) => string | undefined)(t),
+          busy: /\d+%/.test((t as HTMLElement).innerText),
+        })),
+      TILE_ID_JS,
+    );
+    const newTiles = tiles.filter((t) => t.id && !before.includes(t.id));
+    // Flow titles a clip while it is still rendering ("Camera pushing in on deity 19%", 2026-10-09), and a title is
+    // enough to identify a tile, so a new tile only counts once its progress is gone - otherwise the download starts on a
+    // half-made clip. New tiles are listed first, so anything beyond the requested count is not ours.
+    const fresh = [...new Set(newTiles.filter((t) => !t.busy).map((t) => t.id!))];
+    if (fresh.length >= count && !newTiles.some((t) => t.busy)) return fresh.slice(0, count);
     const progress = await page.evaluate(() =>
       [...document.querySelectorAll("flow-grid-tile-container")].slice(0, 8).map((t) => (t as HTMLElement).innerText.match(/\d+%/)?.[0]).filter(Boolean),
     );
@@ -291,6 +392,15 @@ async function uploadAsset(page: Page, job: Job, file: string, label: string): P
   await page.getByRole("menuitem", { name: "Upload", exact: true }).click();
   await (await chooser).setFiles(staged);
   await waitForNewMedia(page, before, 1, 90_000);
+  // The grid shows the upload at once as a local preview known only by its title, but the pickers offer it only once
+  // Flow has stored it and the tile carries a media id: attaching straight away timed out on 2026-10-09.
+  await page
+    .locator(`flow-grid-tile-container[aria-label="${name}"] [data-media-id]`)
+    .first()
+    .waitFor({ state: "attached", timeout: 120_000 })
+    .catch(() => {
+      throw new Error(`Flow did not finish storing the upload ${name} within 2 minutes; nothing was generated.`);
+    });
   return name;
 }
 
@@ -303,23 +413,31 @@ const optionByName = (list: Locator, name: string) =>
 // The frame pickers attach on click; the ingredients picker only previews and needs "Add to prompt".
 // Option names are "<asset name>" or "<asset name> Image|Video", so match on the prefix.
 async function attachAsset(page: Page, opener: Locator, assetName: string): Promise<void> {
-  await opener.click();
   const list = page.getByRole("listbox", { name: "Asset list" });
-  await list.waitFor({ state: "visible", timeout: 10_000 });
-  let option = optionByName(list, assetName);
-  // Voices, characters and avatars live behind their own tabs, so look there when "All" does not have it.
-  if (!(await option.isVisible().catch(() => false))) {
-    for (const tab of ["Voices", "Characters", "Avatars", "Uploads"]) {
-      const t = page.getByRole("tab", { name: tab, exact: true });
-      if (!(await t.isVisible().catch(() => false))) continue;
-      await t.click();
-      await pause(page, 1200);
-      option = optionByName(list, assetName);
-      if (await option.isVisible().catch(() => false)) break;
+  // A picker keeps the list it opened with, so an asset stored a moment ago can be missing: close it and look again.
+  for (let attempt = 0; ; attempt++) {
+    await opener.click();
+    await list.waitFor({ state: "visible", timeout: 10_000 });
+    let option = optionByName(list, assetName);
+    // Voices, characters and avatars live behind their own tabs, so look there when "All" does not have it.
+    if (!(await option.isVisible().catch(() => false))) {
+      for (const tab of ["Voices", "Characters", "Avatars", "Uploads"]) {
+        const t = page.getByRole("tab", { name: tab, exact: true });
+        if (!(await t.isVisible().catch(() => false))) continue;
+        await t.click();
+        await pause(page, 1200);
+        option = optionByName(list, assetName);
+        if (await option.isVisible().catch(() => false)) break;
+      }
     }
+    if (await option.waitFor({ state: "visible", timeout: 5000 }).then(() => true, () => false)) {
+      await option.click();
+      break;
+    }
+    await page.keyboard.press("Escape");
+    if (attempt >= 4) throw new Error(`Flow's picker never offered "${assetName}"; nothing was generated.`);
+    await pause(page, 3000);
   }
-  await option.waitFor({ state: "visible", timeout: 10_000 });
-  await option.click();
   const add = page.getByRole("button", { name: "Add to prompt", exact: true });
   if (await add.waitFor({ state: "visible", timeout: 1500 }).then(() => true, () => false)) await add.click().catch(() => {});
   await list.waitFor({ state: "hidden", timeout: 10_000 });
@@ -371,28 +489,23 @@ function tileByIdOrTitle(page: Page, id: string, title?: string): TileResolver {
   };
 }
 
-const DOWNLOAD_DIR = join(HOME_DIR, "downloads");
-let downloadsReady = false;
-
 // Playwright keeps a download in a per-connection temp file it can delete from under us; pointing Chrome itself at a
 // directory we own makes the bytes ours the moment they land.
 async function useOwnDownloadDir(page: Page): Promise<void> {
-  // Setting this once per process was not enough: another CDP client attaching resets it browser-wide, and Chrome
-  // quietly goes back to ~/Downloads. Every file we "could not download" tonight was sitting there the whole time,
-  // so this is re-asserted before every single download rather than cached behind a flag.
+  // Setting this once per process was not enough: another CDP client attaching resets it browser-wide. It is
+  // re-asserted before every single download, and the profile's own download folder (chrome.ts) is this same folder,
+  // so a reset still lands the file here.
   mkdirSync(DOWNLOAD_DIR, { recursive: true });
   const cdp = await page.context().newCDPSession(page);
   await cdp.send("Browser.setDownloadBehavior", { behavior: "allowAndName", downloadPath: DOWNLOAD_DIR, eventsEnabled: true }).catch(() => {});
-  downloadsReady = true;
 }
 
-// Chrome's own Downloads folder, where files land whenever the override above has been reset out from under us.
-const SYSTEM_DOWNLOADS = join(homedir(), "Downloads");
-
-// Everything already sitting in either folder, so a new arrival can be told apart from what was there before.
+// Everything already sitting in our download folder, so a new arrival can be told apart from what was there before.
+// ~/Downloads is deliberately never watched: anything the user's own browsers saved there in the meantime would have
+// been taken for Flow's file and moved into a film folder.
 function downloadsNow(): Set<string> {
   const seen = new Set<string>();
-  for (const dir of [DOWNLOAD_DIR, SYSTEM_DOWNLOADS]) if (existsSync(dir)) for (const f of readdirSync(dir)) seen.add(`${dir}/${f}`);
+  if (existsSync(DOWNLOAD_DIR)) for (const f of readdirSync(DOWNLOAD_DIR)) seen.add(join(DOWNLOAD_DIR, f));
   return seen;
 }
 
@@ -402,22 +515,81 @@ async function waitForDownloadedFile(page: Page, before: Set<string>, timeoutMs:
   let stable: { path: string; size: number } | undefined;
   while (Date.now() < deadline) {
     await pause(page, 1000);
-    // Both places: ours, and Chrome's own folder for when the override has been reset behind our back.
-    const candidates: string[] = [];
-    for (const dir of [DOWNLOAD_DIR, SYSTEM_DOWNLOADS]) {
-      if (!existsSync(dir)) continue;
-      for (const f of readdirSync(dir)) {
-        if (before.has(`${dir}/${f}`) || f.endsWith(".crdownload") || f.startsWith(".")) continue;
-        candidates.push(join(dir, f));
-      }
-    }
+    const candidates = existsSync(DOWNLOAD_DIR)
+      ? readdirSync(DOWNLOAD_DIR)
+          .filter((f) => !before.has(join(DOWNLOAD_DIR, f)) && !f.endsWith(".crdownload") && !f.startsWith("."))
+          .map((f) => join(DOWNLOAD_DIR, f))
+      : [];
     for (const path of candidates) {
       const size = statSync(path).size;
       if (stable?.path === path && stable.size === size && size > 0) return path;
       stable = { path, size };
     }
   }
-  throw new Error("Flow started the download but no file arrived in either the tool's folder or ~/Downloads.");
+  throw new Error(`Flow started the download but no file arrived in ${DOWNLOAD_DIR}. The media is still in Flow: flow_download fetches it again for free.`);
+}
+
+// A download of the user's own that got caught in the borrowed folder goes on to ~/Downloads under its own name.
+function handBack(guid: string, name: string): void {
+  const from = join(DOWNLOAD_DIR, guid);
+  if (!existsSync(from)) return;
+  const home = join(homedir(), "Downloads");
+  const ext = extname(name);
+  let to = join(home, name);
+  for (let i = 1; existsSync(to); i++) to = join(home, `${name.slice(0, name.length - ext.length)} (${i})${ext}`);
+  renameSync(from, to);
+}
+
+// Runs `start` (the click that makes Flow download) and returns the saved file. In the tool's own Chrome every download
+// goes to DOWNLOAD_DIR, which is watched for the new arrival. In the user's own Chrome (ATTACH) that folder is borrowed
+// for this one download only and the browser's normal behaviour is restored straight after; the file is picked out by
+// Chrome's own download events for the tool's tab, and anything the user downloads meanwhile is handed back.
+async function captureDownload(page: Page, start: () => Promise<void>, timeoutMs: number): Promise<string> {
+  if (!ATTACH) {
+    await useOwnDownloadDir(page);
+    const before = downloadsNow();
+    await start();
+    return waitForDownloadedFile(page, before, timeoutMs);
+  }
+  mkdirSync(DOWNLOAD_DIR, { recursive: true });
+  const pageSession = await page.context().newCDPSession(page);
+  const frame = (await pageSession.send("Page.getFrameTree")).frameTree.frame.id;
+  await pageSession.detach().catch(() => {});
+  const session = await page.context().browser()!.newBrowserCDPSession();
+  const names = new Map<string, string>();
+  const finished = new Set<string>();
+  let ours: string | undefined;
+  let canceled = false;
+  session.on("Browser.downloadWillBegin", (e) => {
+    names.set(e.guid, e.suggestedFilename);
+    if (!ours && e.frameId === frame) ours = e.guid;
+  });
+  session.on("Browser.downloadProgress", (e) => {
+    if (e.state === "completed") {
+      finished.add(e.guid);
+      if (e.guid !== ours && names.has(e.guid)) handBack(e.guid, names.get(e.guid)!);
+    }
+    if (e.state === "canceled" && e.guid === ours) canceled = true;
+  });
+  await session.send("Browser.setDownloadBehavior", { behavior: "allowAndName", downloadPath: DOWNLOAD_DIR, eventsEnabled: true });
+  try {
+    await start();
+    const deadline = Date.now() + timeoutMs;
+    while (!ours || !finished.has(ours)) {
+      if (canceled) throw new Error("Chrome cancelled Flow's download.");
+      if (Date.now() > deadline) {
+        throw new Error(`Flow's download did not finish within ${Math.round(timeoutMs / 1000)}s. The media is still in Flow: flow_download fetches it again for free.`);
+      }
+      await pause(page, 500);
+    }
+    return join(DOWNLOAD_DIR, ours);
+  } finally {
+    await session.send("Browser.setDownloadBehavior", { behavior: "default" }).catch(() => {});
+    // Downloads of the user's that started in the borrowed folder finish there; keep listening a while to hand them back.
+    const pending = [...names.keys()].filter((g) => g !== ours && !finished.has(g));
+    if (pending.length) setTimeout(() => void session.detach().catch(() => {}), 10 * 60_000);
+    else await session.detach().catch(() => {});
+  }
 }
 
 // Flow reveals a tile's controls on a genuine pointer move, so the mouse is driven to the tile itself.
@@ -499,35 +671,43 @@ async function renameTile(page: Page, tile: Locator, title: string): Promise<boo
 }
 
 async function downloadTile(page: Page, target: Locator | TileResolver, targetStem: string, quality: DownloadQuality): Promise<string[]> {
-  await useOwnDownloadDir(page);
   const resolve: TileResolver = typeof target === "function" ? target : async () => target;
   let lastError: unknown;
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
       const tile = await resolve();
-      const before = downloadsNow();
-      // Flow only shows a tile's toolbar for a real pointer move over it - Playwright's hover() does not trigger it.
-      // The toolbar's "More options" beats a right-click, which can land on the <video> and raise Chrome's own menu.
-      await hoverTile(page, tile);
-      const more = tile.getByRole("button", { name: "More options" });
-      if (await more.isVisible({ timeout: 3000 }).catch(() => false)) await more.click();
-      else await tile.click({ button: "right" });
-      const download = page.getByRole("menuitem", { name: "Download", exact: true });
-      if (!(await download.isVisible({ timeout: 8000 }).catch(() => false))) {
-        // Saying what Flow actually offered turns "locator timed out" into something that explains itself next time.
-        const items = await page.locator('[role="menuitem"]').evaluateAll((ms) => ms.map((m) => (m.textContent ?? "").replace(/\s+/g, " ").trim()));
-        throw new Error(items.length ? `Flow's tile menu has no Download item. It offered: ${items.join(" | ")}` : "Flow's tile menu did not open.");
-      }
-      await download.click({ timeout: 10_000 });
-      // Size submenu: "720p Original size" / "1K Original size", or the best upscale the plan allows.
-      const original = page.getByRole("menuitem", { name: /original/i }).first();
-      if (await original.waitFor({ state: "visible", timeout: 3000 }).then(() => true, () => false)) {
-        const upscaled = page.locator('[role="menuitem"]:not([aria-disabled="true"]):not([disabled])').filter({ hasText: /upscaled/i }).first();
-        const wanted = quality === "upscaled" && (await upscaled.isVisible().catch(() => false)) ? upscaled : original;
-        await wanted.click();
-      }
       // Upscales are rendered on demand, so they can take minutes to appear.
-      const file = await waitForDownloadedFile(page, before, quality === "upscaled" ? 600_000 : 180_000);
+      const file = await captureDownload(
+        page,
+        async () => {
+          // Flow only shows a tile's toolbar for a real pointer move over it - Playwright's hover() does not trigger it.
+          // The toolbar's "More options" beats a right-click, which can land on the <video> and raise Chrome's own menu.
+          await hoverTile(page, tile);
+          const more = tile.getByRole("button", { name: "More options" });
+          if (await more.isVisible({ timeout: 3000 }).catch(() => false)) await more.click();
+          else await tile.click({ button: "right" });
+          const download = page.getByRole("menuitem", { name: "Download", exact: true });
+          if (!(await download.isVisible({ timeout: 8000 }).catch(() => false))) {
+            // Saying what Flow actually offered turns "locator timed out" into something that explains itself next time.
+            const items = await page.locator('[role="menuitem"]').evaluateAll((ms) => ms.map((m) => (m.textContent ?? "").replace(/\s+/g, " ").trim()));
+            throw new Error(items.length ? `Flow's tile menu has no Download item. It offered: ${items.join(" | ")}` : "Flow's tile menu did not open.");
+          }
+          await download.click({ timeout: 10_000 });
+          // Size submenu: "720p Original size" / "1K Original size", then the upscales. "upscaled" means the free one -
+          // 1080p for a clip, 2K for a still - and never 4K, which costs credits on a clip (50 on Ultra).
+          const original = page.getByRole("menuitem", { name: /original/i }).first();
+          if (await original.waitFor({ state: "visible", timeout: 3000 }).then(() => true, () => false)) {
+            const upscaled = page
+              .locator('[role="menuitem"]:not([aria-disabled="true"]):not([disabled])')
+              .filter({ hasText: /\b(1080p|2K)\b/i })
+              .filter({ hasNotText: /4K|credit/i })
+              .first();
+            const wanted = quality === "upscaled" && (await upscaled.isVisible().catch(() => false)) ? upscaled : original;
+            await wanted.click();
+          }
+        },
+        quality === "upscaled" ? 600_000 : 180_000,
+      );
       const kind = extensionOf(file);
       let saved: string[];
       if (kind === ".zip") saved = unpackTakes(file, targetStem);
@@ -563,7 +743,7 @@ async function ensureProjectGrid(page: Page): Promise<void> {
 // Drives one generation in the Flow tab and returns the downloaded file paths.
 export async function runGeneration(job: Job): Promise<string[]> {
   const state = await getFlowState();
-  if (!state.signedIn || !state.inProject) throw new Error(state.hint);
+  if (!state.signedIn || !state.inProject || !state.onScreen) throw new Error(state.hint);
   const page = await getFlowPage();
   const s = job.params;
 
@@ -623,8 +803,9 @@ export async function runGeneration(job: Job): Promise<string[]> {
     // Flow names clips itself and reuses those names, so two takes of one scene come back identically titled and
     // neither can be found by name afterwards. Renaming each finished tile to the scene's own file stem makes every
     // later lookup - download, continue, assemble - unambiguous. Best effort: a failed rename must not lose the clip.
-    const renamed = await renameTile(page, mediaTile(page, id), `${basename(s.output_dir)}-${label}`).catch(() => false);
-    if (renamed) job.note = [job.note, `renamed in Flow to ${basename(s.output_dir)}-${label}`].filter(Boolean).join(" · ");
+    const title = s.named ? label : `${basename(s.output_dir)}-${label}`;
+    const renamed = await renameTile(page, mediaTile(page, id), title).catch(() => false);
+    if (renamed) job.note = [job.note, `renamed in Flow to ${title}`].filter(Boolean).join(" · ");
     await pause(page, 800);
     const stem = join(s.output_dir, label);
     files.push(...(await downloadMedia(page, id, stem, s.download_quality)));
@@ -683,7 +864,7 @@ async function scanGrid(page: Page, stopAt?: (assets: FlowAsset[]) => boolean): 
 // entries that actually carry a character thumbnail count.
 export async function listCharacters(): Promise<string[]> {
   const state = await getFlowState();
-  if (!state.signedIn || !state.inProject) throw new Error(state.hint);
+  if (!state.signedIn || !state.inProject || !state.onScreen) throw new Error(state.hint);
   const page = await getFlowPage();
   await dismissOverlays(page);
   await page.getByRole("navigation", { name: "Project navigation" }).getByText("Characters", { exact: true }).click();
@@ -713,22 +894,25 @@ async function leaveCharacterEditor(page: Page): Promise<void> {
 // Playwright's download event, is why an edit that worked never reached disk (2026-10-02). Point at the picture, then
 // download through the same watched folders as every other file.
 async function savePortrait(page: Page, name: string): Promise<string> {
-  await useOwnDownloadDir(page);
   const dir = join(process.env.FLOW_MCP_OUTPUT ?? join(homedir(), "flow-mcp-out"), "_cast");
   mkdirSync(dir, { recursive: true });
   const picture = page.getByRole("img", { name: "Generated character image" }).first();
   const button = page.getByRole("button", { name: "Download image", exact: true });
-  const before = downloadsNow();
-  let pressed = false;
-  for (let attempt = 0; attempt < 3 && !pressed; attempt++) {
-    await hoverTile(page, picture);
-    pressed = await button.click({ timeout: 4000 }).then(
-      () => true,
-      () => false,
-    );
-  }
-  if (!pressed) throw new Error("Flow never showed the portrait's Download image button");
-  const file = await waitForDownloadedFile(page, before, 90_000);
+  const file = await captureDownload(
+    page,
+    async () => {
+      let pressed = false;
+      for (let attempt = 0; attempt < 3 && !pressed; attempt++) {
+        await hoverTile(page, picture);
+        pressed = await button.click({ timeout: 4000 }).then(
+          () => true,
+          () => false,
+        );
+      }
+      if (!pressed) throw new Error("Flow never showed the portrait's Download image button");
+    },
+    90_000,
+  );
   const portrait = join(dir, `${name.replace(/[^\w.-]+/g, "_")}${extensionOf(file)}`);
   renameSync(file, portrait);
   return portrait;
@@ -739,7 +923,7 @@ async function savePortrait(page: Page, name: string): Promise<string> {
 // portrait never reached disk.
 export async function editCharacter(name: string, change?: string, job?: Job): Promise<{ name: string; portrait?: string; note?: string }> {
   const state = await getFlowState();
-  if (!state.signedIn || !state.inProject) throw new Error(state.hint);
+  if (!state.signedIn || !state.inProject || !state.onScreen) throw new Error(state.hint);
   const page = await getFlowPage();
   await leaveCharacterEditor(page);
   await dismissOverlays(page);
@@ -800,7 +984,7 @@ export async function editCharacter(name: string, change?: string, job?: Job): P
 
 export async function listAssets(): Promise<FlowAsset[]> {
   const state = await getFlowState();
-  if (!state.signedIn || !state.inProject) throw new Error(state.hint);
+  if (!state.signedIn || !state.inProject || !state.onScreen) throw new Error(state.hint);
   const page = await getFlowPage();
   const assets = await scanGrid(page);
   await scrollToTop(page);
@@ -810,7 +994,7 @@ export async function listAssets(): Promise<FlowAsset[]> {
 // Downloads media that already exists in the project, matched by (the start of) its title.
 export async function downloadAsset(name: string, targetStem: string, quality: DownloadQuality): Promise<string[]> {
   const state = await getFlowState();
-  if (!state.signedIn || !state.inProject) throw new Error(state.hint);
+  if (!state.signedIn || !state.inProject || !state.onScreen) throw new Error(state.hint);
   const page = await getFlowPage();
   const matches = (a: FlowAsset) => a.name.toLowerCase().startsWith(name.toLowerCase());
   const found = (await scanGrid(page, (assets) => assets.some(matches))).find(matches);
@@ -825,7 +1009,7 @@ export async function downloadAsset(name: string, targetStem: string, quality: D
 // EXACT title, and an ambiguous title is refused: Flow reuses titles, and trashing the wrong one is the worst outcome.
 export async function trashAsset(name: string): Promise<{ trashed: string }> {
   const state = await getFlowState();
-  if (!state.signedIn || !state.inProject) throw new Error(state.hint);
+  if (!state.signedIn || !state.inProject || !state.onScreen) throw new Error(state.hint);
   const page = await getFlowPage();
   await ensureProjectGrid(page);
   const same = (await scanGrid(page)).filter((a) => a.name === name);
@@ -836,7 +1020,8 @@ export async function trashAsset(name: string): Promise<{ trashed: string }> {
   const tile = tileOf(page, same[0]);
   await hoverTile(page, tile);
   await tile.getByRole("button", { name: "More options" }).click();
-  await page.getByRole("menuitem", { name: "Move to trash", exact: true }).click();
+  // US English says "Move to trash"; a UK English browser says "Move to bin" (seen 2026-10-09).
+  await page.getByRole("menuitem", { name: /^Move to (trash|bin)$/i }).click();
   await pause(page, 2000);
   if (await tile.count()) throw new Error(`"${name}" is still in the project - Flow did not move it to Trash.`);
   await scrollToTop(page);
@@ -848,7 +1033,6 @@ export async function trashAsset(name: string): Promise<{ trashed: string }> {
 // scene..." before the file arrives (a 29 s scene took a few seconds). The user showed this route; verified 2026-10-01.
 // Nothing may be pressed while it exports - an Escape here cancelled an earlier attempt.
 async function downloadScene(page: Page, scene: FlowAsset, targetStem: string): Promise<string[]> {
-  await useOwnDownloadDir(page);
   const tile = tileOf(page, scene);
   await hoverTile(page, tile);
   const box = await tile.boundingBox();
@@ -856,9 +1040,7 @@ async function downloadScene(page: Page, scene: FlowAsset, targetStem: string): 
   else await tile.click();
   await page.waitForURL(/\/scene\//, { timeout: 30_000 });
   await pause(page, 3000);
-  const before = downloadsNow();
-  await page.getByRole("button", { name: "Download scene", exact: true }).click();
-  const file = await waitForDownloadedFile(page, before, 600_000);
+  const file = await captureDownload(page, () => page.getByRole("button", { name: "Download scene", exact: true }).click(), 600_000);
   const target = `${targetStem}${extensionOf(file)}`;
   renameSync(file, target);
   await page.getByRole("button", { name: "Back button to go to previous page" }).click().catch(() => {});
@@ -897,7 +1079,7 @@ export function rememberCharacter(name: string, look: string): void {
 
 export async function createCharacter(c: CharacterParams, job?: Job): Promise<{ name: string; url: string; portrait?: string }> {
   const state = await getFlowState();
-  if (!state.signedIn || !state.inProject) throw new Error(state.hint);
+  if (!state.signedIn || !state.inProject || !state.onScreen) throw new Error(state.hint);
   const page = await getFlowPage();
   // A description generates the portrait first (free image), then the character is built from that picture.
   let portrait: string | undefined;
@@ -998,7 +1180,7 @@ const EDIT_TIMEOUT_MS = 10 * 60_000;
 // cost is measured from the balance instead (a 4 s Omni clip cost 20 credits). The result is a new tile.
 export async function runEdit(job: Job): Promise<string[]> {
   const state = await getFlowState();
-  if (!state.signedIn || !state.inProject) throw new Error(state.hint);
+  if (!state.signedIn || !state.inProject || !state.onScreen) throw new Error(state.hint);
   const page = await getFlowPage();
   const s = job.params;
   const title = s.edit_asset!;
@@ -1245,7 +1427,7 @@ async function agentRound(
 // add the avatar or character as a second chip. Verified step by step against the live UI on 2026-09-20.
 export async function runContinue(job: Job): Promise<string[]> {
   const state = await getFlowState();
-  if (!state.signedIn || !state.inProject) throw new Error(state.hint);
+  if (!state.signedIn || !state.inProject || !state.onScreen) throw new Error(state.hint);
   const page = await getFlowPage();
   const s = job.params;
   const balance = await readCredits(page).catch(() => undefined);
@@ -1357,7 +1539,7 @@ export async function runContinue(job: Job): Promise<string[]> {
 
 export async function runAgentBatch(job: Job): Promise<string[]> {
   const state = await getFlowState();
-  if (!state.signedIn || !state.inProject) throw new Error(state.hint);
+  if (!state.signedIn || !state.inProject || !state.onScreen) throw new Error(state.hint);
   const page = await getFlowPage();
   const s = job.params;
   const scenes = s.agent_scenes!;

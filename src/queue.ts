@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { keepDisplayAwake } from "./platform.js";
 
 export type JobStatus = "queued" | "running" | "done" | "failed" | "cancelled";
 
@@ -25,6 +26,8 @@ export interface SceneParams {
   download_quality?: "original" | "upscaled";
   output_dir: string;
   file_stem: string;
+  // The caller named the scene, so its tile in Flow takes that name as it is rather than "<folder>-<stem>".
+  named?: boolean;
 }
 
 export interface Job {
@@ -106,6 +109,8 @@ export class JobQueue {
   private async work(): Promise<void> {
     if (this.working) return;
     this.working = true;
+    // Flow only works on a lit, unlocked screen, so the display stays on while jobs wait or run.
+    const release = keepDisplayAwake();
     try {
       for (;;) {
         const job = this.list().find((j) => j.status === "queued");
@@ -137,6 +142,7 @@ export class JobQueue {
         this.lastFinished = Date.now();
       }
     } finally {
+      release();
       this.working = false;
     }
   }

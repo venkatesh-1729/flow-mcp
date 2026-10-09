@@ -8,11 +8,15 @@ export const PLAYBOOK = {
     "No call blocks for more than about 45 s. A reply with still_working and a task_id means Flow is still busy with it: pass the task_id to flow_wait, and never repeat the call.",
   ],
   models: {
-    "Omni 1.1 Flash": "7 credits at 4s, 12 at 8s (720p). Supports duration 4/6/8/10 and 360p/720p. Best default for drafts and frame-to-frame transitions.",
-    "Veo 3.1 - Lite": "10 credits, fixed 8s.",
-    "Veo 3.1 - Fast": "20 credits, fixed 8s.",
-    "Veo 3.1 - Quality": "100 credits, fixed 8s. Needs max_credits raised explicitly.",
-    "Nano Banana 2": "Images, 0 credits. Use it to make keyframes and product stills before spending on video.",
+    prices:
+      "Credits differ by plan and change over time. Flow's own quote is read before every generation and max_credits caps it, so these are for planning only. Measured on Pro (Sep 2026) and Ultra (Oct 2026).",
+    "Omni 1.1 Flash": "720p: 7 / 10 / 12 / 15 credits for 4 / 6 / 8 / 10 s; 360p: 4 / 5 / 6 / 7. Durations 4/6/8/10 and 360p/720p. Best default for drafts and frame-to-frame transitions.",
+    "Veo 3.1 - Lite": "5 credits on Ultra, 10 on Pro.",
+    "Veo 3.1 - Fast": "10 credits on Ultra, 20 on Pro.",
+    "Veo 3.1 - Quality": "100 credits. Needs max_credits raised explicitly.",
+    "Nano Banana Pro / Nano Banana 2": "Images, 0 credits. Use them to make keyframes and stills before spending on video.",
+    downloads:
+      "A clip's 720p original and 1080p upscale are free, as are a still's 1K and 2K. A clip's 4K upscale costs credits (50 on Ultra), so download_quality 'upscaled' never picks it.",
   },
   prompt_order: "subject and action -> shot size and camera move -> location -> visual style -> lighting -> sound/dialogue",
   prompt_rules: [

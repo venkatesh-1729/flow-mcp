@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, renameSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, extname, join } from "node:path";
@@ -76,6 +76,39 @@ export function extractZip(zip: string, dest: string): string[] {
   };
   walk(dest);
   return files;
+}
+
+// Flow is driven through a real window, and an idle Mac turns its display off and then locks, after which Chrome paints
+// nothing and no click lands (a laptop on battery dims after 2 minutes). While jobs run, `caffeinate -d` keeps the display
+// on; -w ties it to this process so it can never outlive the tool. Elsewhere this does nothing. Returns the release.
+export function keepDisplayAwake(): () => void {
+  if (!IS_MAC) return () => {};
+  try {
+    const child = spawn("caffeinate", ["-d", "-w", String(process.pid)], { stdio: "ignore" });
+    child.on("error", () => {});
+    return () => void child.kill();
+  } catch {
+    return () => {};
+  }
+}
+
+// The command line of the process listening on a local TCP port, or undefined when it cannot be told (no lsof, no
+// PowerShell networking cmdlets, nothing listening).
+export function listenerCommandLine(port: number): string | undefined {
+  try {
+    if (IS_WIN) {
+      const out = powershell(
+        `$p = (Get-NetTCPConnection -LocalPort ${port} -State Listen -ErrorAction Stop | Select-Object -First 1).OwningProcess; (Get-CimInstance Win32_Process -Filter "ProcessId=$p").CommandLine`,
+        15_000,
+      );
+      return out.trim() || undefined;
+    }
+    const pid = execFileSync("lsof", ["-nP", `-iTCP:${port}`, "-sTCP:LISTEN", "-t"], { encoding: "utf8", timeout: 10_000 }).trim().split(/\s+/)[0];
+    if (!pid) return undefined;
+    return execFileSync("ps", ["-o", "command=", "-p", pid], { encoding: "utf8", timeout: 10_000 }).trim() || undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 // Opens a page in the default browser.

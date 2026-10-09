@@ -97,11 +97,23 @@ server.registerTool(
 );
 
 server.registerTool(
+  "flow_project",
+  {
+    title: "Open or create a Flow project",
+    description:
+      "Open the Flow project with this exact title, creating it (free) when create is true; with no title, list the projects. Every other tool works in the project that is open, so call this first when a film has its own project.",
+    inputSchema: shapes.open_project,
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+  },
+  (args) => reply(patient("flow_project", core.open_project(args))),
+);
+
+server.registerTool(
   "flow_generate",
   {
     title: "Queue Flow generations",
     description:
-      "Queue one clip or image per scene in the open Flow project. Runs one at a time with human-like pauses and spends the user's Google AI credits (approx. per video: Omni 1.1 Flash 7-12, Veo 3.1 Lite 10, Fast 20, Quality 100; images 0). Each scene is checked against max_credits using Flow's own quote before anything is spent. Returns job ids immediately; use flow_wait for results.",
+      "Queue one clip or image per scene in the open Flow project. Runs one at a time with human-like pauses and spends the user's Google AI credits (approx. per video: Omni 1.1 Flash 7-15 by length; Veo 3.1 Lite 5 on Ultra / 10 on Pro, Fast 10 / 20, Quality 100; images 0). Each scene is checked against max_credits using Flow's own quote before anything is spent. Returns job ids immediately; use flow_wait for results.",
     inputSchema: shapes.generate,
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
   },

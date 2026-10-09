@@ -8,6 +8,11 @@ async function call(method: string, args: unknown): Promise<unknown> {
     method: "POST",
     headers: { "content-type": "application/json", "x-flow-token": readFileSync(TOKEN_FILE, "utf8").trim() },
     body: JSON.stringify(args ?? {}),
+  }).catch((err: Error & { cause?: { code?: string } }) => {
+    // The owner is decided once, at start-up: when that process ends (its app session closed), this one cannot take over.
+    throw new Error(
+      `The flow-mcp process that owned the Flow tab has stopped (${err.cause?.code ?? err.message}). Restart this app's flow MCP server, or keep Flow Studio running (npm run studio) as the owner.`,
+    );
   });
   const data = (await res.json()) as { error?: string };
   if (!res.ok) throw new Error(data.error ?? `flow-mcp owner process answered ${res.status}`);
@@ -30,6 +35,7 @@ export class RemoteCore implements Core {
   character_edit = (a: unknown) => call("character_edit", a);
   edit = (a: unknown) => call("edit", a);
   trash = (a: unknown) => call("trash", a);
+  open_project = (a: unknown) => call("open_project", a);
   discard = (a: unknown) => call("discard", a);
   set_key = (a: unknown) => call("set_key", a);
   continue_shot = (a: unknown) => call("continue_shot", a);
