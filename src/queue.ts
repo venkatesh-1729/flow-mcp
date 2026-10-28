@@ -46,6 +46,44 @@ export interface Job {
 
 export type JobRunner = (job: Job) => Promise<string[]>;
 
+// One Flow page per process, so one turn at a time on it: a queued job and every call that clicks, scrolls or reads
+// through the page (status readout, listing, downloads, characters, projects) wait for each other, first come first
+// served. Calls relayed from other sessions run in the owner process, so they queue here too. Before this, a download
+// started in the pacing gap was still scrolling the grid when the next job opened its first-frame picker, and the
+// picker's option was detached from under it (k5, 2026-10-09).
+export class PageLock {
+  private tail: Promise<void> = Promise.resolve();
+  private waiting = 0;
+  holder: string | null = null;
+
+  get busy(): boolean {
+    return this.holder !== null || this.waiting > 0;
+  }
+
+  async run<T>(label: string, work: () => Promise<T>): Promise<T> {
+    const turn = this.tail;
+    let done!: () => void;
+    this.tail = new Promise<void>((r) => (done = r));
+    this.waiting++;
+    await turn;
+    this.waiting--;
+    this.holder = label;
+    try {
+      return await work();
+    } finally {
+      this.holder = null;
+      done();
+    }
+  }
+
+  // Only when nothing holds the page or waits for it; otherwise undefined at once, for callers that must not wait.
+  tryRun<T>(label: string, work: () => Promise<T>): Promise<T> | undefined {
+    return this.busy ? undefined : this.run(label, work);
+  }
+}
+
+export const pageLock = new PageLock();
+
 // Flow is driven like a careful person would: one generation at a time, with a
 // randomised pause between them.
 const PAUSE_MIN_MS = Number(process.env.FLOW_MCP_PAUSE_MIN_S ?? 25) * 1000;
@@ -57,7 +95,10 @@ export class JobQueue {
   private lastFinished = 0;
   pausedReason: string | null = null;
 
-  constructor(private runner: JobRunner) {}
+  constructor(
+    private runner: JobRunner,
+    private lock: PageLock = pageLock,
+  ) {}
 
   add(params: SceneParams): Job {
     const job: Job = {
@@ -71,10 +112,6 @@ export class JobQueue {
     this.jobs.set(job.id, job);
     void this.work();
     return job;
-  }
-
-  get busy(): boolean {
-    return this.list().some((j) => j.status === "running");
   }
 
   get(id: string): Job | undefined {
@@ -125,21 +162,27 @@ export class JobQueue {
           }
         }
         if (job.status !== "queued") continue;
-        job.status = "running";
-        job.attempts++;
-        try {
-          job.files = await this.runner(job);
-          job.status = "done";
-          job.error = undefined;
-        } catch (err) {
-          job.error = err instanceof Error ? err.message : String(err);
-          // Failed tiles are already retried inside Flow (its own Retry button); only an agent that produced nothing
-          // is re-queued here. Timeouts are never retried automatically: they may still have spent credits.
-          const retryable = /agent finished without creating/i.test(job.error);
-          job.status = retryable && job.attempts <= (job.params.retries ?? 1) ? "queued" : "failed";
-        }
-        job.finishedAt = new Date().toISOString();
-        this.lastFinished = Date.now();
+        if (this.lock.busy) this.pausedReason = `waiting for ${this.lock.holder ?? "another call"} to finish with Flow's page`;
+        await this.lock.run(`job ${job.id} (${job.params.file_stem})`, async () => {
+          this.pausedReason = null;
+          if (job.status !== "queued") return; // cancelled while it waited for the page
+          job.status = "running";
+          job.attempts++;
+          try {
+            job.files = await this.runner(job);
+            job.status = "done";
+            job.error = undefined;
+          } catch (err) {
+            job.error = err instanceof Error ? err.message : String(err);
+            // Failed tiles are already retried inside Flow (its own Retry button); only an agent that produced nothing,
+            // and a scene whose frames were not in their slots when Generate was due (checkFrames, nothing spent), are
+            // re-queued here. Timeouts are never retried automatically: they may still have spent credits.
+            const retryable = /agent finished without creating|composer did not hold this scene's/i.test(job.error);
+            job.status = retryable && job.attempts <= (job.params.retries ?? 1) ? "queued" : "failed";
+          }
+          job.finishedAt = new Date().toISOString();
+          this.lastFinished = Date.now();
+        });
       }
     } finally {
       release();

@@ -23,12 +23,16 @@ const VIDEO_TIMEOUT_MS = 12 * 60_000;
 const FAILURE_TEXT = /failed|couldn.t|unable/i;
 const OFF_SCREEN =
   "Flow's window is not on screen: the screen is locked or asleep, or the window is minimised or fully covered. Chrome paints nothing there, so nothing can be clicked. Unlock the screen and leave the Flow window at least partly visible. Nothing was spent.";
+// The same, met half-way through a job, when something may already have been spent.
+const NOT_PAINTED = "Flow's window went off screen (locked or sleeping screen, or the window minimised or covered), so nothing in it could be clicked";
 // A job that finds Flow's window covered waits for the user to pause this long before bringing Chrome forward, and gives
 // up after WAIT_FOR_PAUSE_MS of the user working without a pause.
 const PAUSE_BEFORE_RAISE_S = 6;
 const WAIT_FOR_PAUSE_MS = 15 * 60_000;
 
 const pause = (page: Page, ms: number) => page.waitForTimeout(ms);
+const addNote = (job: Job, text: string) => void (job.note = [job.note, text].filter(Boolean).join(" · "));
+const firstLine = (err: unknown) => (err instanceof Error ? err.message : String(err)).split("\n")[0];
 
 // Chrome paints nothing for a window that is minimised, fully covered, or on a locked or sleeping screen, and then no
 // click lands: Playwright waits for an animation frame that never comes (2026-10-09, a locked laptop). A covered window
@@ -70,6 +74,10 @@ async function onScreen(page: Page, patient = false): Promise<boolean> {
   return false;
 }
 
+let lastState: (FlowState & { as_of: string }) | undefined;
+// The page as last read, for a status check that finds a job or another call driving it.
+export const lastFlowState = () => lastState;
+
 // `detailed` opens the account panel to read the balance, so it must not run while a generation is driving the page.
 // `patient` (every job) waits for a pause in the user's own work to bring Flow's window forward; a status check never does.
 export async function getFlowState(detailed = false, patient = false): Promise<FlowState> {
@@ -91,6 +99,7 @@ export async function getFlowState(detailed = false, patient = false): Promise<F
     state.credits_remaining = await readCredits(page).catch(() => undefined);
     state.composer = await settingsTrigger(page).innerText().then((t) => t.replace(/\s+/g, " ").trim(), () => undefined);
   }
+  lastState = { ...state, as_of: new Date().toISOString() };
   return state;
 }
 
@@ -142,7 +151,7 @@ export async function openProject(title?: string, create = false): Promise<{ pro
   const box = projectTitle(page);
   await box.waitFor({ state: "visible", timeout: 20_000 });
   await box.click();
-  await page.keyboard.press("ControlOrMeta+a");
+  await selectAll(box);
   await page.keyboard.type(title, { delay: 20 });
   await page.keyboard.press("Enter");
   await pause(page, 2000);
@@ -401,7 +410,7 @@ const ASSET_PREFIX = "asset:";
 
 // Uploads under a unique filename so the asset can be picked unambiguously afterwards.
 // "asset:<name>" refers to something already in the Flow project (image, video, character) and skips the upload.
-async function uploadAsset(page: Page, job: Job, file: string, label: string): Promise<string> {
+export async function uploadAsset(page: Page, job: Job, file: string, label: string): Promise<string> {
   if (file.startsWith(ASSET_PREFIX)) return file.slice(ASSET_PREFIX.length).trim();
   if (!existsSync(file)) throw new Error(`File not found: ${file}`);
   const name = `fm-${job.id}-${label}${extname(file).toLowerCase()}`;
@@ -426,6 +435,62 @@ async function uploadAsset(page: Page, job: Job, file: string, label: string): P
   return name;
 }
 
+// The media id of a tile in the grid, by its exact title, when the tile is mounted (an upload just made always is).
+const tileMediaId = (page: Page, title: string) =>
+  page
+    .locator(`flow-grid-tile-container[aria-label="${title.replace(/"/g, '\\"')}"] [data-media-id]`)
+    .first()
+    .getAttribute("data-media-id", { timeout: 3000 })
+    .then((id) => id ?? undefined, () => undefined);
+
+export interface FrameWanted {
+  slot: "start" | "end";
+  name: string;
+  id?: string;
+}
+
+// What the Frames composer's Start and End slots hold (mapped 2026-10-09): an empty slot is a button.empty-chip
+// reading "Start" or "End"; a filled one turns into button.chip-container[aria-label="Image ingredient"] around an
+// img whose src names the picture's media id (flow-content.google/image/<uuid>). They sit either side of "Swap first
+// and last frames". Per slot: null when empty, the media id when filled ("" if none shows), undefined when unreadable.
+export async function frameSlots(page: Page): Promise<{ start?: string | null; end?: string | null } | undefined> {
+  return page.evaluate(() => {
+    const buttons = [...document.querySelectorAll("button")];
+    const swap = buttons.findIndex((b) => b.getAttribute("aria-label") === "Swap first and last frames");
+    if (swap < 0) return undefined;
+    const held = (b?: Element) => {
+      if (b?.classList.contains("empty-chip")) return null;
+      if (b?.getAttribute("aria-label") !== "Image ingredient") return undefined;
+      return b.querySelector("img")?.getAttribute("src")?.match(/[0-9a-f]{8}-[0-9a-f-]{27}/)?.[0] ?? "";
+    };
+    return { start: held(buttons[swap - 1]), end: held(buttons[swap + 1]) };
+  });
+}
+
+// The frames a scene asked for must be in their slots when Generate is pressed. Flow once made a paid clip with the
+// Start slot empty (k2-brahma, 2026-10-09): the picker took the click but kept no frame, and the clip came out as plain
+// text-to-video, 10 credits for nothing. So the slots are read right before Generate, and anything but this scene's
+// own pictures stops the job with nothing spent (queue.ts retries that once by itself, matching this wording).
+const FRAME_NOT_HELD = "Flow's composer did not hold this scene's";
+export async function checkFrames(page: Page, wanted: FrameWanted[]): Promise<void> {
+  if (!wanted.length) return;
+  // A chip can show its picture's id a moment after the picker closes, so the slots get a few seconds to settle.
+  let held = await frameSlots(page);
+  const settled = () => wanted.every((f) => held?.[f.slot] && (!f.id || held[f.slot] === f.id));
+  for (let i = 0; i < 10 && !settled(); i++) {
+    await pause(page, 500);
+    held = await frameSlots(page);
+  }
+  for (const f of wanted) {
+    const has = held?.[f.slot];
+    if (has && (!f.id || has === f.id)) continue;
+    const seen = !held ? "Flow showed no Start/End slots" : has === null ? "it was empty" : has === undefined ? "it could not be read" : `it held another picture (${has || "no id"})`;
+    throw new Error(
+      `${FRAME_NOT_HELD} ${f.slot === "start" ? "first" : "last"} frame (${f.name}) when Generate was due: ${seen}. Nothing was generated or spent.`,
+    );
+  }
+}
+
 const escapeRe = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
 // Options read "<name>", "<name> Image|Video|Avatar" or "<voice> <description>", so match on the leading name.
@@ -434,7 +499,7 @@ const optionByName = (list: Locator, name: string) =>
 
 // The frame pickers attach on click; the ingredients picker only previews and needs "Add to prompt".
 // Option names are "<asset name>" or "<asset name> Image|Video", so match on the prefix.
-async function attachAsset(page: Page, opener: Locator, assetName: string): Promise<void> {
+export async function attachAsset(page: Page, opener: Locator, assetName: string): Promise<void> {
   const list = page.getByRole("listbox", { name: "Asset list" });
   // A picker keeps the list it opened with, so an asset stored a moment ago can be missing: close it and look again.
   for (let attempt = 0; ; attempt++) {
@@ -466,6 +531,19 @@ async function attachAsset(page: Page, opener: Locator, assetName: string): Prom
   await pause(page, 500);
 }
 
+// Cmd+A only selects on a Mac when Playwright sends it with Chrome's "selectAll" editing command, which it does only for
+// a browser it knows to be a Mac. The Playwright Extension's relay names no platform (its user agent is
+// "CDP-Bridge-Server/1.0.0"), so there Cmd+A selected nothing and typing went in at the caret: tiles came out as
+// "Women tossing blossoms in gardenk4-spring" and projects as "Oct 09 -TS · Manidweepam 21:08" (2026-10-09). The page
+// selects the field's text itself instead, which works in every mode.
+async function selectAll(field: Locator): Promise<void> {
+  await field.evaluate((el) => {
+    (el as HTMLElement).focus();
+    if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) el.select();
+    else document.execCommand("selectAll");
+  });
+}
+
 // The prompt as the box shows it, for comparing: one line, plain quotes and dashes (an editor may curl them).
 const plainText = (text: string) =>
   text
@@ -481,7 +559,7 @@ async function typePrompt(page: Page, prompt: string): Promise<void> {
   const wanted = prompt.replace(/\s*\n+\s*/g, " ").trim();
   for (let attempt = 0; attempt < 2; attempt++) {
     await box.click();
-    await page.keyboard.press("ControlOrMeta+a");
+    await selectAll(box);
     await page.keyboard.press("Delete");
     await page.keyboard.type(wanted, { delay: 8 });
     await pause(page, 500);
@@ -662,17 +740,43 @@ async function captureDownload(page: Page, start: () => Promise<void>, timeoutMs
   }
 }
 
-// Flow reveals a tile's controls on a genuine pointer move, so the mouse is driven to the tile itself.
-async function hoverTile(page: Page, tile: Locator): Promise<void> {
-  await tile.scrollIntoViewIfNeeded();
-  const box = await tile.boundingBox();
-  if (box) {
-    await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
-    await pause(page, 900);
-  } else {
-    await tile.hover();
-    await pause(page, 900);
+// Where a tile sits once it holds still: the grid lays itself out again while renders finish. A tile that keeps moving
+// for 3 s is taken where it is now; its centre is still on it, and what the pointer then finds inside it is checked.
+async function steadyBox(page: Page, tile: Locator): Promise<{ x: number; y: number; width: number; height: number }> {
+  let before = await tile.boundingBox({ timeout: 5000 });
+  for (let i = 0; i < 12; i++) {
+    await pause(page, 250);
+    const box = await tile.boundingBox({ timeout: 5000 });
+    if (box && before && box.width > 0 && box.x === before.x && box.y === before.y && box.width === before.width && box.height === before.height) return box;
+    before = box;
   }
+  if (!before?.width) throw new Error("The tile is not visible in Flow's grid.");
+  return before;
+}
+
+// Flow reveals a tile's controls on a genuine pointer move, so the mouse is driven to the tile itself. Playwright's
+// scroll first waits for the tile to hold still, which it can only see while Chrome paints the window (a covered or
+// minimised window paints nothing). It gave up after 30 s on three clips that were already made and paid for (k3-banyan,
+// k2-brahma, k3-light, 2026-10-09). So every try first brings Flow back on screen (waiting for a pause in the user's
+// work, as a job's start does), and a few short tries replace one long wait; the later ones scroll through the page
+// itself, in case the tile never holds still for Playwright.
+async function hoverTile(page: Page, tile: Locator): Promise<void> {
+  let last: unknown;
+  for (let attempt = 0; attempt < 4; attempt++) {
+    if (!(await onScreen(page, true))) throw new Error(NOT_PAINTED);
+    try {
+      if (attempt < 2) await tile.scrollIntoViewIfNeeded({ timeout: 8000 });
+      else await tile.evaluate((el) => el.scrollIntoView({ block: "center" }), undefined, { timeout: 8000 });
+      const box = await steadyBox(page, tile);
+      await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+      await pause(page, 900);
+      return;
+    } catch (err) {
+      last = err;
+      await pause(page, 1500 * (attempt + 1));
+    }
+  }
+  throw last;
 }
 
 // Chrome's "allowAndName" writes each download under a bare id with NO extension, so there is nothing to copy from
@@ -713,30 +817,73 @@ function unpackTakes(zip: string, targetStem: string): string[] {
   return out;
 }
 
+// A finished tile shows no progress ("NN%") and holds its picture or clip. Flow titles a clip while it is still
+// rendering, so a title alone proves nothing.
+async function tileFinished(page: Page, tile: Locator, timeoutMs = 60_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  const finished = () =>
+    tile
+      .evaluate((t) => !/\d+%/.test((t as HTMLElement).innerText) && Boolean(t.querySelector("img[src], video[src], [data-media-id]")), undefined, { timeout: 5000 })
+      .catch(() => false);
+  while (!(await finished())) {
+    if (Date.now() > deadline) throw new Error("The tile never finished rendering.");
+    await pause(page, 1500);
+  }
+}
+
+// The box a tile's Rename opens (mapped 2026-10-09): an <input> labelled "Editable text" like the project title in the
+// top bar, but marked "editing", outside the tile itself, beside Done and Cancel buttons. It opens holding the old
+// title with the caret at its end, which is why a select-all that did nothing appended the new name. Escape cancels it.
+const renameBox = (page: Page) => page.locator('input[aria-label="Editable text"].editing').last();
+
 // Flow titles clips itself and happily reuses a title: two takes of the same scene both came back as "Woman climbing
 // granite wall", which makes a clip impossible to identify by name and cost real time tonight. Renaming each finished
-// tile to our own scene name fixes it at the source - the user's suggestion, and the right one.
-async function renameTile(page: Page, tile: Locator, title: string): Promise<boolean> {
-  try {
-    await hoverTile(page, tile);
-    const more = tile.getByRole("button", { name: "More options" });
-    if (!(await more.isVisible({ timeout: 3000 }).catch(() => false))) return false;
-    await more.click();
-    const rename = page.getByRole("menuitem", { name: "Rename", exact: true });
-    if (!(await rename.isVisible({ timeout: 4000 }).catch(() => false))) {
-      await page.keyboard.press("Escape");
-      return false;
+// tile to our own scene name fixes it at the source - the user's suggestion, and the right one. The old title is
+// selected in the page and replaced, the box is checked before Enter, and a rename only counts once the tile shows it.
+// Never throws: by now the clip is made and paid for, and a failed rename must not fail the job. Returns the tile's
+// handle afterwards (a tile known only by its title is found by the new one).
+export async function renameTile(page: Page, id: string, title: string): Promise<{ id: string; renamed: boolean; was?: string; why?: string }> {
+  const tile = mediaTile(page, id);
+  const renamed = id.startsWith("title:") ? `title:${title}` : id;
+  const was = (await tile.getAttribute("aria-label", { timeout: 5000 }).catch(() => null)) ?? undefined;
+  let why = "";
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      await tileFinished(page, tile);
+      await hoverTile(page, tile);
+      await tile.getByRole("button", { name: "More options" }).click({ timeout: 5000 });
+      await page.getByRole("menuitem", { name: "Rename", exact: true }).click({ timeout: 5000 });
+      const box = renameBox(page);
+      await box.waitFor({ state: "attached", timeout: 5000 });
+      await selectAll(box);
+      await page.keyboard.type(title, { delay: 8 });
+      const typed = await box.inputValue({ timeout: 3000 });
+      if (typed !== title) throw new Error(`the name box held "${typed}"`);
+      await page.keyboard.press("Enter");
+      await pause(page, 1500);
+      const now = await mediaTile(page, renamed).getAttribute("aria-label", { timeout: 5000 }).catch(() => null);
+      if (now === title) return { id: renamed, renamed: true, was };
+      why = now === null ? "the tile could not be found again afterwards" : `the tile reads "${now}"`;
+    } catch (err) {
+      why = firstLine(err);
+      await page.keyboard.press("Escape").catch(() => {});
+      if (why === NOT_PAINTED) break;
     }
-    await rename.click();
-    await pause(page, 1200);
-    await page.keyboard.press("ControlOrMeta+a");
-    await page.keyboard.type(title, { delay: 8 });
-    await page.keyboard.press("Enter");
-    await pause(page, 1500);
-    return true;
-  } catch {
-    await page.keyboard.press("Escape").catch(() => {});
-    return false;
+    await pause(page, 2000 * (attempt + 1));
+  }
+  return { id, renamed: false, was, why };
+}
+
+// Once Flow has finished making something the credits are spent, and a job that then ends "failed" invites a second,
+// paid run: k3-banyan and k2-brahma were made and paid for, then failed at the hover (2026-10-09). From that point on a
+// problem becomes a note on a "done" job, naming the tile that flow_download fetches for free.
+async function saveFinished(page: Page, job: Job, id: string, stem: string): Promise<string[]> {
+  try {
+    return await downloadMedia(page, id, stem, job.params.download_quality);
+  } catch (err) {
+    const title = await mediaTile(page, id).getAttribute("aria-label", { timeout: 3000 }).catch(() => null);
+    addNote(job, `made in Flow${title ? ` as "${title}"` : ""} and paid for, but not downloaded (${firstLine(err)}). Fetch it with flow_download, free; never generate it again`);
+    return [];
   }
 }
 
@@ -792,6 +939,8 @@ async function downloadTile(page: Page, target: Locator | TileResolver, targetSt
       return saved;
     } catch (err) {
       lastError = err;
+      // hoverTile has already waited for the window to come back; another try would only wait again.
+      if (err instanceof Error && err.message === NOT_PAINTED) break;
       await page.keyboard.press("Escape").catch(() => {});
       await pause(page, 2000);
     }
@@ -831,11 +980,13 @@ export async function runGeneration(job: Job): Promise<string[]> {
     );
   }
 
-  if (s.first_frame) {
-    await attachAsset(page, page.getByRole("button", { name: "Start", exact: true }), await uploadAsset(page, job, s.first_frame, "start"));
-  }
-  if (s.last_frame) {
-    await attachAsset(page, page.getByRole("button", { name: "End", exact: true }), await uploadAsset(page, job, s.last_frame, "end"));
+  // Each frame is remembered with its media id, so the slots can be checked right before Generate (checkFrames).
+  const frames: FrameWanted[] = [];
+  for (const [slot, file] of [["start", s.first_frame], ["end", s.last_frame]] as const) {
+    if (!file) continue;
+    const name = await uploadAsset(page, job, file, slot);
+    await attachAsset(page, page.getByRole("button", { name: slot === "start" ? "Start" : "End", exact: true }), name);
+    frames.push({ slot, name, id: await tileMediaId(page, name) });
   }
   // Flow's composer offers Frames OR Ingredients, never both: a clip with first/last frames cannot also carry
   // reference images. The frames already pin the look, so the references are dropped and the job says so.
@@ -861,25 +1012,26 @@ export async function runGeneration(job: Job): Promise<string[]> {
   if (!(await start.isEnabled())) throw new Error("Flow's Start generation button is disabled; the prompt or inputs were not accepted.");
   await scrollToTop(page);
   const before = await mediaIds(page);
+  await checkFrames(page, frames);
   await start.click();
 
   const variants = s.variants ?? 1;
   const fresh = await waitForNewMedia(page, before, variants, s.type === "image" ? IMAGE_TIMEOUT_MS : VIDEO_TIMEOUT_MS, job);
   job.progress = undefined;
 
+  // Made, and paid for: nothing from here on may fail the job (saveFinished).
   mkdirSync(s.output_dir, { recursive: true });
   const files: string[] = [];
-  for (const [i, id] of fresh.entries()) {
+  for (const [i, made] of fresh.entries()) {
     const label = fresh.length > 1 ? `${s.file_stem}-v${i + 1}` : s.file_stem;
     // Flow names clips itself and reuses those names, so two takes of one scene come back identically titled and
     // neither can be found by name afterwards. Renaming each finished tile to the scene's own file stem makes every
-    // later lookup - download, continue, assemble - unambiguous. Best effort: a failed rename must not lose the clip.
+    // later lookup - download, continue, assemble - unambiguous. A rename that does not take is a note.
     const title = s.named ? label : `${basename(s.output_dir)}-${label}`;
-    const renamed = await renameTile(page, mediaTile(page, id), title).catch(() => false);
-    if (renamed) job.note = [job.note, `renamed in Flow to ${title}`].filter(Boolean).join(" · ");
+    const { id, renamed, was, why } = await renameTile(page, made, title);
+    addNote(job, renamed ? `renamed in Flow to ${title}` : `not renamed: Flow's title stays "${was ?? "?"}" (${why})`);
     await pause(page, 800);
-    const stem = join(s.output_dir, label);
-    files.push(...(await downloadMedia(page, id, stem, s.download_quality)));
+    files.push(...(await saveFinished(page, job, id, join(s.output_dir, label))));
     await pause(page, 1500);
   }
   return files;
@@ -1015,7 +1167,7 @@ export async function editCharacter(name: string, change?: string, job?: Job): P
 
     const box = page.locator(".ProseMirror").last();
     await box.click();
-    await page.keyboard.press("ControlOrMeta+a");
+    await selectAll(box);
     // Delete leaves a full selection standing in this editor; Backspace clears it (mapped 2026-10-02).
     await page.keyboard.press("Backspace");
     // The character editor always draws a wide 16:9 picture (1376x768), whatever shape the portrait was. Told only "make
@@ -1159,7 +1311,7 @@ export async function createCharacter(c: CharacterParams, job?: Job): Promise<{ 
     if (!c.describe) throw new Error("Pass either an image or a description for the character.");
     if (job) job.progress = "drawing the character";
     const dir = join(process.env.FLOW_MCP_OUTPUT ?? join(homedir(), "flow-mcp-out"), "_cast");
-    const made = await runGeneration({
+    const drawing = {
       ...(job ?? ({ id: "char", status: "running", files: [], attempts: 1, createdAt: "" } as unknown as Job)),
       files: [],
       params: {
@@ -1170,8 +1322,10 @@ export async function createCharacter(c: CharacterParams, job?: Job): Promise<{ 
         output_dir: dir,
         file_stem: c.name.replace(/[^\w.-]+/g, "_"),
       },
-    } as Job);
-    portrait = made[0];
+    } as Job;
+    portrait = (await runGeneration(drawing))[0];
+    // runGeneration keeps a finished image even when its download fails, and says so in a note instead.
+    if (!portrait) throw new Error(`Flow drew ${c.name}'s portrait, but it could not be saved, so no character was made: ${drawing.note ?? "no file arrived"}.`);
     c = { ...c, image: portrait };
   }
   const image = c.image!;
@@ -1274,7 +1428,7 @@ export async function runEdit(job: Job): Promise<string[]> {
 
   const box = page.locator(".ProseMirror").last();
   await box.click();
-  await page.keyboard.press("ControlOrMeta+a");
+  await selectAll(box);
   await page.keyboard.press("Delete");
   const prompt = s.prompt.replace(/\s*\n+\s*/g, " ").trim();
   await page.keyboard.type(prompt, { delay: 8 });
@@ -1299,12 +1453,18 @@ export async function runEdit(job: Job): Promise<string[]> {
   }
   job.progress = undefined;
 
-  await page.getByRole("button", { name: "Back button to go to previous page" }).click();
-  await pause(page, 2500);
-  await ensureProjectGrid(page);
-  const fresh = await waitForNewMedia(page, before, 1, 90_000);
-  mkdirSync(s.output_dir, { recursive: true });
-  const saved = await downloadMedia(page, fresh[0], join(s.output_dir, s.file_stem), s.download_quality);
+  // The edit is made and paid for: from here on a problem is a note, never a failure (saveFinished).
+  let saved: string[] = [];
+  try {
+    await page.getByRole("button", { name: "Back button to go to previous page" }).click();
+    await pause(page, 2500);
+    await ensureProjectGrid(page);
+    const fresh = await waitForNewMedia(page, before, 1, 90_000);
+    mkdirSync(s.output_dir, { recursive: true });
+    saved = await saveFinished(page, job, fresh[0], join(s.output_dir, s.file_stem));
+  } catch (err) {
+    addNote(job, `the edit was made in Flow and paid for, but its new clip was not found in the grid (${firstLine(err)}). It is titled like "${found.name}": fetch it with flow_download, free; never run the edit again`);
+  }
   const after = await readCredits(page).catch(() => undefined);
   if (balance !== undefined && after !== undefined) job.credits = balance - after;
   return saved;
@@ -1349,8 +1509,9 @@ async function closeAgentSession(page: Page): Promise<void> {
   const clear = page.getByRole("button", { name: "Clear prompt" });
   if (await clear.isVisible().catch(() => false)) await clear.click();
   else {
-    await page.locator(".ProseMirror").first().click();
-    await page.keyboard.press("ControlOrMeta+a");
+    const box = page.locator(".ProseMirror").first();
+    await box.click();
+    await selectAll(box);
     await page.keyboard.press("Delete");
   }
   await pause(page, 400);
@@ -1592,7 +1753,7 @@ export async function runContinue(job: Job): Promise<string[]> {
     const fresh = await waitForNewMedia(page, before, 1, VIDEO_TIMEOUT_MS, job);
     job.progress = undefined;
     mkdirSync(s.output_dir, { recursive: true });
-    const saved = await downloadMedia(page, fresh[0], join(s.output_dir, s.file_stem), s.download_quality);
+    const saved = await saveFinished(page, job, fresh[0], join(s.output_dir, s.file_stem));
     const after = await readCredits(page).catch(() => undefined);
     if (balance !== undefined && after !== undefined) job.credits = balance - after;
     return saved;
@@ -1670,8 +1831,9 @@ export async function runAgentBatch(job: Job): Promise<string[]> {
     for (let attempt = 0; attempt < 2 && !ok; attempt++) {
       if (attempt || n) await pause(page, 8000);
       try {
-        files.push(...(await runGeneration(single)));
-        ok = true;
+        const got = await runGeneration(single);
+        files.push(...got);
+        ok = got.length > 0; // a finished image whose download failed comes back empty, with a note
       } catch {
         /* one more attempt, then give up on this scene */
       }

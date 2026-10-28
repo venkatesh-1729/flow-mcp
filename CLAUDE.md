@@ -69,6 +69,30 @@ Goal: feature parity with OmniFlow (lingoflow.pro/omniflow), using subscription 
 - Verified 2026-10-09 in attach mode: flow_status, flow_project (open + create), flow_generate with a local first frame
   (Omni 1.1 Flash 6 s and Veo 3.1 Fast 8 s, 10 credits each, balance 10,050 → 10,030), rename to the scene name, the free
   1080p and 720p downloads (only into ~/.flow-mcp/downloads; ~/Downloads untouched), flow_assets, flow_wait task ids.
+- Extension mode has NO working Cmd+A (found 2026-10-09 evening): the relay answers Browser.getVersion with user agent
+  "CDP-Bridge-Server/1.0.0", so Playwright's `_platform()` says linux and sends Meta+A without Chrome's "selectAll"
+  editing command, which on a Mac selects nothing. Typing then went in at the caret: tiles "Women tossing blossoms in
+  gardenk4-spring", projects "Oct 09 -TS · Manidweepam 21:08" (reproduced live: "delta" + Cmd+A + "X" = "deltaX").
+  `selectAll(locator)` selects in the page (input.select() / execCommand("selectAll")); never press ControlOrMeta+a.
+- Tile Rename (mapped live 2026-10-09, TS · Sandbox): tile menu (`More options`) → `Rename` focuses an
+  `<input aria-label="Editable text" class="editable-text-input editing">` OUTSIDE the tile container (the project
+  title in the top bar is an "Editable text" input too), holding the old title with the caret at its end, beside
+  `Done` and `Cancel`; Enter commits, Escape cancels. renameTile verifies the box before Enter and the tile's title after.
+- Four Omni clips (k3-banyan, k2-brahma, k3-light, k4-ambika, 10 credits each) were made, then failed the job with
+  "scrollIntoViewIfNeeded … waiting for element to be stable" at the rename/download hover. That check needs animation
+  frames; a covered or minimised window gives none (likely cause, not proven). Now: hoverTile brings Flow on screen first (patient), waits for the
+  tile to hold still, retries short; and after Flow finishes a paid clip nothing fails the job - rename and download
+  problems are notes on a `done` job (saveFinished).
+- Frames slots (mapped live 2026-10-09, TS · Sandbox): empty = `button.empty-chip` reading "Start"/"End"; filled =
+  `button.chip-container[aria-label="Image ingredient"]` with an img whose src is flow-content.google/image/<media id>
+  (the same id as the tile's data-media-id; checked for an upload and for a generated still); the two flank
+  "Swap first and last frames". `Clear prompt` empties them; select-all + Delete in the prompt box leaves them. A
+  freshly attached chip may show no id for a moment. k2-brahma (10 credits) was made as plain text-to-video with an
+  empty Start slot, so checkFrames reads the slots right before Generate and stops unspent unless each holds this
+  job's own upload (frameSlots/checkFrames); the queue retries that error once by itself.
+- One PageLock (queue.ts) per process: queued jobs and every page-driving LocalCore call take turns, FIFO; relayed
+  calls run in the owner, so they queue too; flow_status uses tryRun and answers from lastFlowState() while busy.
+  RemoteCore uses node:http, because fetch drops an answer slower than 300 s (undici headers timeout).
 
 ## Flow UI map (verified 2026-09-19, flow.google.com, Pro plan)
 

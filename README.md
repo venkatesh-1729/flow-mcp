@@ -200,7 +200,7 @@ agree on what is running. That API listens on 127.0.0.1 only and needs a per-run
 
 | Tool | Purpose |
 |---|---|
-| `flow_status` | Session state (signed in, which project is open, plan, credits left), queue, pacing, prompt playbook |
+| `flow_status` | Session state (signed in, which project is open, plan, credits left), queue, pacing, prompt playbook. Never waits: while a job has Flow's window it answers from the last reading (`page_busy`, no balance) |
 | `flow_project` | Open a project by its exact title, or create it (free) with `create: true`; with no title, list the projects |
 | `flow_generate` | Queue scenes: prompt, image or video, model, aspect, duration, resolution, variants, first/last frame, reference images, `max_credits` cap, and an optional `name` (file name and Flow title, e.g. a shot id) |
 | `flow_wait` | Wait for jobs, or for the task id of a slow call; returns file paths and results. Answers within about 40 s, so call again until `finished` is true |
@@ -245,8 +245,24 @@ key → Save key**. It's checked with Google before it's saved, and stored only 
 
 - One generation at a time, with a random 25–70 second pause between them. The page carries an
   invisible reCAPTCHA; this drives the real interface at human pace and does nothing to evade it.
+- One thing at a time drives Flow's window. Queued jobs and every call that clicks or reads through it (status
+  readout, listing, downloads, characters, projects, trash) take turns, first come first served, including calls
+  relayed from other Claude sessions and the panel. A download asked for while a clip renders waits for it (after
+  about 45 s it answers `still_working` with a task id for `flow_wait`), and the next clip waits for a running
+  download. `flow_status` never waits: while the window is busy it answers from its last reading, says what has the
+  window (`page_busy`), and leaves out the balance.
 - Before each generation the server reads Flow's own credit quote and skips the scene if it exceeds
   `max_credits` (default 25).
+- A scene with `first_frame` / `last_frame` is checked once more right before Generate: Flow's Start and End slots must
+  hold exactly the pictures this scene uploaded (matched by media id). If a slot is empty or holds another picture, the
+  scene stops with nothing spent and goes back in the queue once by itself.
+- Once Flow has finished a clip, the credits are spent, so the job ends `done` whatever happens next. If renaming the
+  tile or downloading the file fails, the job's note says so and names the tile: fetch it with `flow_download`, free.
+  A paid clip is never reported as `failed`, which would invite a second, paid run. Before renaming and downloading,
+  the job waits for the tile to finish and hold still, and for Flow's window to be on screen again (as it does before
+  it starts).
+- A named scene's tile is renamed in Flow: the old title is selected in the page and replaced, and the note says
+  "renamed in Flow to …" only once Flow shows the new title.
 - Downloads go only to `~/.flow-mcp/downloads` and are then moved into the project folder; `~/Downloads` is never
   watched, so nothing of yours is ever picked up by mistake.
 - Environment variables: `GEMINI_API_KEY`, `FLOW_MCP_PORT` (8787), `FLOW_MCP_OUTPUT`,
@@ -264,6 +280,14 @@ key → Save key**. It's checked with Google before it's saved, and stored only 
 | Attach mode: *"Could not attach to your Chrome"* | Chrome's Allow prompt went unanswered (it waits 5 minutes), or remote debugging is off at `chrome://inspect/#remote-debugging` |
 | *"Port 9339 is held by a Chrome that is not flow-mcp's own profile"* | Another automation Chrome holds the port. Close it, or set `FLOW_MCP_CDP_PORT` everywhere the tool starts |
 | A clip generated but no file arrived | The media is still in Flow. `flow_download` pulls it back for nothing — never re-generate and pay twice |
+| A `done` job with no file, note *"made in Flow as "…" and paid for, but not downloaded"* | The clip exists and was paid for; the note names its tile. `flow_download` it by that title, free — never generate it again |
+| A job note *"not renamed: Flow's title stays "…""* | The clip was made and downloaded; only its tile in Flow kept Flow's own title. Rename it in Flow by hand if you like |
+| `flow_status` shows `page_busy` and no balance | A job or another call has Flow's window right now. Ask again when it is free for the full readout |
+| `flow_download` or `flow_assets` answers `still_working` | It is waiting its turn behind a running clip, or still working. Pass the `task_id` to `flow_wait`; don't call the tool again |
+| *"Timed out after … waiting for Flow to finish"* | The clip may still finish in Flow and be charged. Check `flow_assets` and the balance before running it again |
+| *"Flow's composer did not hold this scene's first frame (fm-…-start.png) when Generate was due"* | The frame did not stay in its Start slot, so Generate was never pressed and nothing was spent. The scene retries once by itself; after that, `flow_retry` |
+| A failed job with *"scrollIntoViewIfNeeded … waiting for element to be stable"* | Servers before 9 Oct 2026 only: the clip was made and paid for, then renaming or downloading it failed. `flow_download` it — never re-generate |
+| Extension mode, before 9 Oct 2026: a name kept the old text (*"Oct 09 -TS · Film 21:08"*, *"… gardenk4-spring"*) | Cmd+A selected nothing through the extension, so the new name went in at the caret. Fixed; rename the old ones in Flow by hand |
 | Everything times out | The Chrome window was closed, or the machine slept. Reopen it with `npm run login` |
 
 ---

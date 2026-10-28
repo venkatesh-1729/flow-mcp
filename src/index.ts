@@ -89,7 +89,7 @@ server.registerTool(
   {
     title: "Flow status",
     description:
-      "Check the Flow Chrome session (signed in, project open, plan, credits left) and the generation queue. Call this first; it says what the user must fix before generating, and returns the prompt playbook.",
+      "Check the Flow Chrome session (signed in, project open, plan, credits left) and the generation queue. Call this first; it says what the user must fix before generating, and returns the prompt playbook. While a job or another call is driving Flow's window it answers at once from the last reading, with page_busy and no balance: ask again later for the balance.",
     inputSchema: shapes.status,
     annotations: { readOnlyHint: true, openWorldHint: true },
   },

@@ -5,8 +5,8 @@ import { z } from "zod";
 import { assemble, localVoices, speakLocally } from "./assemble.js";
 import { GEMINI_VOICES, geminiKey, saveGeminiKey, speakWithGemini } from "./gemini.js";
 import { extractLastFrame } from "./chain.js";
-import { characterLook, createCharacter, downloadAsset, trashAsset, editCharacter, getFlowState, listAssets, listCharacters, openProject, rememberCharacter, runAgentBatch, runContinue, runEdit, runGeneration } from "./flow.js";
-import { JobQueue, type Job } from "./queue.js";
+import { characterLook, createCharacter, downloadAsset, trashAsset, editCharacter, getFlowState, lastFlowState, listAssets, listCharacters, openProject, rememberCharacter, runAgentBatch, runContinue, runEdit, runGeneration } from "./flow.js";
+import { JobQueue, pageLock, type Job } from "./queue.js";
 import { BIN, COMPUTER, IS_MAC, IS_WIN, moveToBin } from "./platform.js";
 import { TECHNIQUES, techniqueById } from "./techniques.js";
 
@@ -253,7 +253,9 @@ export const VOICES = [
   { name: "Iapetus", description: "male, clear, mid-low pitch" },
 ];
 
-const BUSY = "A generation is running in the Flow tab. Wait for it to finish (flow_wait), then retry.";
+// Everything that drives Flow's page takes its turn through pageLock (queue.ts): a call made while a job or another call
+// has the page waits for it, and a job waits for a running call. Slow turns come back as still_working (index.ts).
+const page = <T>(label: string, work: () => Promise<T>) => pageLock.run(label, work);
 
 export class LocalCore implements Core {
   private queue: JobQueue = new JobQueue(async (job) => {
@@ -274,8 +276,22 @@ export class LocalCore implements Core {
     return runGeneration(job);
   });
 
+  // A status check never waits for the page: while a job or another call has it, the answer is the page as last read,
+  // without the balance (a stale balance would spoil a before/after comparison), and says what has the page.
   async status({ detailed }: Args<"status">) {
-    const flow = await getFlowState(detailed && !this.queue.busy);
+    const read = pageLock.tryRun("flow_status", () => getFlowState(detailed));
+    const last = read ? undefined : lastFlowState();
+    const flow = read
+      ? await read
+      : {
+          url: last?.url,
+          signedIn: last?.signedIn,
+          inProject: last?.inProject,
+          onScreen: last?.onScreen,
+          project: last?.project,
+          as_of: last?.as_of,
+          page_busy: `${pageLock.holder ?? "another call"} has Flow's page; ask again when it is free for the full readout`,
+        };
     return { flow, pacing: this.queue.pausedReason, output_root: OUTPUT_ROOT, jobs: this.queue.list().map(jobView) };
   }
 
@@ -362,26 +378,27 @@ export class LocalCore implements Core {
   }
 
   async assets({ kind }: Args<"assets">) {
-    if (this.queue.busy) throw new Error(BUSY);
-    return (await listAssets()).filter((a) => !kind || a.kind === kind).map(({ name, kind }) => ({ name, kind }));
+    return (await page("flow_assets", listAssets)).filter((a) => !kind || a.kind === kind).map(({ name, kind }) => ({ name, kind }));
   }
 
   async download({ project, assets, quality }: Args<"download">) {
-    if (this.queue.busy) throw new Error(BUSY);
     const dir = projectDir(project);
     mkdirSync(dir, { recursive: true });
     const files: string[] = [];
-    // Numbering from 1 every call overwrote clips fetched earlier - it destroyed a finished shot once. Carry on from
-    // the highest clip-NN already on disk instead.
-    let next = Math.max(0, ...readdirSync(dir).map((f) => Number(f.match(/^clip-(\d+)/)?.[1] ?? 0))) + 1;
-    for (const name of assets) {
-      try {
-        files.push(...(await downloadAsset(name, join(dir, `clip-${String(next++).padStart(2, "0")}`), quality)));
-      } catch (err) {
-        throw new Error(`${err instanceof Error ? err.message : err} (downloaded so far: ${files.length})`);
+    // The whole list is one turn on the page, so a queued job cannot start between two of its downloads.
+    return page("flow_download", async () => {
+      // Numbering from 1 every call overwrote clips fetched earlier - it destroyed a finished shot once. Carry on from
+      // the highest clip-NN already on disk instead.
+      let next = Math.max(0, ...readdirSync(dir).map((f) => Number(f.match(/^clip-(\d+)/)?.[1] ?? 0))) + 1;
+      for (const name of assets) {
+        try {
+          files.push(...(await downloadAsset(name, join(dir, `clip-${String(next++).padStart(2, "0")}`), quality)));
+        } catch (err) {
+          throw new Error(`${err instanceof Error ? err.message : err} (downloaded so far: ${files.length})`);
+        }
       }
-    }
-    return { dir, files };
+      return { dir, files };
+    });
   }
 
   async assemble({ project, ...rest }: Args<"assemble">) {
@@ -440,7 +457,7 @@ export class LocalCore implements Core {
     // while Flow carries on and charges for it. Re-running then spends twice, which is exactly what happened on
     // 2026-09-20. Flow's own grid is the only honest record, so ask it before starting another paid generation.
     if (!force) {
-      const recent = (await listAssets()).slice(0, 6).filter((a) => a.kind === "video");
+      const recent = (await page("flow_continue", listAssets)).slice(0, 6).filter((a) => a.kind === "video");
       const source = from_asset.toLowerCase();
       const echo = recent.find((a) => {
         const n = a.name.toLowerCase();
@@ -481,29 +498,33 @@ export class LocalCore implements Core {
   }
 
   async trash({ name }: Args<"trash">) {
-    if (this.queue.busy) throw new Error(BUSY);
-    return trashAsset(name);
+    return page("flow_trash", () => trashAsset(name));
   }
 
-  // Switching projects under a queued job would send its scenes to the wrong project, so the queue must be empty.
+  // Switching projects under a queued job would send its scenes to the wrong project, so the queue must be empty - both
+  // when asked and once the page is ours, in case a job was queued while this waited for its turn.
   async open_project({ title, create }: Args<"open_project">) {
-    if (title && this.queue.list().some((j) => j.status === "queued" || j.status === "running")) {
-      throw new Error("Jobs are queued or running in the open project. Wait for them (flow_wait) before switching projects.");
-    }
-    return openProject(title, create);
+    const idle = () => {
+      if (title && this.queue.list().some((j) => j.status === "queued" || j.status === "running")) {
+        throw new Error("Jobs are queued or running in the open project. Wait for them (flow_wait) before switching projects.");
+      }
+    };
+    idle();
+    return page("flow_project", async () => {
+      idle();
+      return openProject(title, create);
+    });
   }
 
   async character(a: Args<"character">) {
-    if (this.queue.busy) throw new Error(BUSY);
     if (!a.image && !a.describe) throw new Error("Pass either `describe` (Flow draws the portrait) or `image`.");
-    const made = await createCharacter(a);
+    const made = await page("flow_character", () => createCharacter(a));
     if (a.describe) rememberCharacter(a.name, a.describe);
     return { ...made, use_as: `asset:${a.name}` };
   }
 
   async character_edit({ name, change, look }: Args<"character_edit">) {
-    if (this.queue.busy) throw new Error(BUSY);
-    const out = await editCharacter(name, change);
+    const out = await page("flow_character_edit", () => editCharacter(name, change));
     // Every scene that references the character quotes this description in its character lock, so it has to describe
     // the NEW look - "deep navy coat" left in it would argue with a portrait whose coat is now red.
     if (look) rememberCharacter(name, look);
@@ -512,8 +533,7 @@ export class LocalCore implements Core {
   }
 
   async characters() {
-    if (this.queue.busy) throw new Error(BUSY);
-    return (await listCharacters()).map((name) => ({ name, use_as: `asset:${name}` }));
+    return (await page("flow_characters", listCharacters)).map((name) => ({ name, use_as: `asset:${name}` }));
   }
 
   // Panel only: deliberately NOT registered as an MCP tool, so a key typed into Flow Studio never reaches Claude.
